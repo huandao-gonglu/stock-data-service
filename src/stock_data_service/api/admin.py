@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from dataclasses import asdict
+from typing import Any
 from typing import Callable
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
@@ -10,6 +11,7 @@ from fastapi.responses import HTMLResponse, Response
 
 from stock_data_service.admin_settings import AdminSettingsStore, validate_admin_sync_settings
 from stock_data_service.baidu.pan_client import BaiduPanClient
+from stock_data_service.auth.baidu_authorizer import BaiduAuthorizationError, BaiduOAuthStateStore, BaiduWebAuthorizer
 from stock_data_service.auth.token_manager import TokenManager
 from stock_data_service.config import Settings
 from stock_data_service.market.calendar import SSETradingCalendar, natural_days
@@ -24,7 +26,31 @@ MAX_CALENDAR_RANGE_DAYS = 366 * 80
 
 
 def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> APIRouter:
+    parent_router = APIRouter()
+    callback_router = APIRouter()
     router = APIRouter(dependencies=[Depends(admin_auth_dependency)])
+    oauth_states = BaiduOAuthStateStore()
+
+    @callback_router.get("/admin/api/baidu/oauth/callback", response_class=HTMLResponse, name="baidu_oauth_callback")
+    def baidu_oauth_callback(
+        request: Request,
+        code: str | None = Query(default=None),
+        state: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+        error_description: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        if error:
+            message = error_description or error
+            return HTMLResponse(_oauth_result_page(False, f"百度授权失败：{message}"), status_code=400)
+        if not code or not state:
+            return HTMLResponse(_oauth_result_page(False, "百度授权回调缺少 code 或 state"), status_code=400)
+        try:
+            _baidu_authorizer(request, settings, oauth_states).exchange_code(code=code, state=state)
+        except Exception as exc:
+            logger.exception("baidu oauth callback failed")
+            return HTMLResponse(_oauth_result_page(False, str(exc)), status_code=400)
+        logger.info("baidu oauth callback finished token_file=%s", settings.baidu_token_file)
+        return HTMLResponse(_oauth_result_page(True, "百度授权成功"))
 
     @router.get("/admin", response_class=HTMLResponse)
     def admin_page() -> HTMLResponse:
@@ -61,10 +87,22 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
                 "baidu_app_secret_configured": bool(settings.baidu_app_secret),
                 "baidu_token_file": str(settings.baidu_token_file),
                 "baidu_token_file_exists": settings.baidu_token_file.exists(),
+                "baidu_redirect_uri": settings.baidu_redirect_uri,
+                "baidu_scope": settings.baidu_scope,
             },
             "sync_defaults": asdict(store.load()),
             "baidu_auth": token_manager.status(),
         }
+
+    @router.post("/admin/api/baidu/oauth/start")
+    def start_baidu_oauth(request: Request) -> dict[str, str]:
+        redirect_uri = _baidu_redirect_uri(request, settings)
+        try:
+            payload = _baidu_authorizer(request, settings, oauth_states).authorization_url(redirect_uri)
+        except BaiduAuthorizationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        logger.info("baidu oauth started redirect_uri=%s", redirect_uri)
+        return payload
 
     @router.post("/admin/api/settings")
     def save_settings(payload: dict = Body(...)) -> dict:
@@ -190,7 +228,9 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
         logger.info("admin sync stop requested job_id=%s", job.id)
         return {"job": job.to_dict()}
 
-    return router
+    parent_router.include_router(callback_router)
+    parent_router.include_router(router)
+    return parent_router
 
 
 def _coverage_calendar(
@@ -301,6 +341,81 @@ def _baidu_client(request: Request, settings: Settings) -> BaiduPanClient:
         app_secret=settings.baidu_app_secret,
     )
     return BaiduPanClient(token_manager=token_manager, enable_cache=True, cache_dir=settings.baidu_cache_dir)
+
+
+def _baidu_authorizer(request: Request, settings: Settings, state_store: BaiduOAuthStateStore) -> BaiduWebAuthorizer:
+    session_factory = getattr(request.app.state, "baidu_oauth_session_factory", None)
+    session = session_factory() if session_factory is not None else None
+    return BaiduWebAuthorizer(
+        app_key=settings.baidu_app_key,
+        app_secret=settings.baidu_app_secret,
+        token_file=str(settings.baidu_token_file),
+        scope=settings.baidu_scope,
+        state_store=state_store,
+        session=session,
+    )
+
+
+def _baidu_redirect_uri(request: Request, settings: Settings) -> str:
+    if settings.baidu_redirect_uri:
+        return settings.baidu_redirect_uri
+    return str(request.url_for("baidu_oauth_callback"))
+
+
+def _oauth_result_page(ok: bool, message: str) -> str:
+    status = "success" if ok else "error"
+    title = "授权成功" if ok else "授权失败"
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{_escape_html(title)}</title>
+  <style>
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f6f7f8;
+      color: #1f2933;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    main {{
+      width: min(420px, calc(100vw - 32px));
+      border: 1px solid #d8dde3;
+      border-radius: 8px;
+      background: #fff;
+      padding: 24px;
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 18px; letter-spacing: 0; }}
+    p {{ margin: 0; color: #667085; line-height: 1.6; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{_escape_html(title)}</h1>
+    <p>{_escape_html(message)}</p>
+  </main>
+  <script>
+    if (window.opener) {{
+      window.opener.postMessage({{type: "baidu-oauth", status: "{status}"}}, window.location.origin);
+    }}
+    setTimeout(() => window.close(), {1200 if ok else 3000});
+  </script>
+</body>
+</html>"""
+
+
+def _escape_html(value: Any) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
 
 
 def _list_baidu_dir(
@@ -843,6 +958,12 @@ _ADMIN_HTML = """<!doctype html>
             <span id="progressText" class="mono">0%</span>
           </div>
           <p id="activeStage" class="message"></p>
+          <div class="status-line">
+            <span id="baiduAuthStatus" class="pill">百度授权读取中</span>
+            <span id="baiduAuthExpires" class="pill">Token -</span>
+            <button id="authorizeBaiduBtn" type="button">百度授权</button>
+          </div>
+          <p id="authMessage" class="message"></p>
           <dl id="systemInfo" class="kv"></dl>
         </div>
       </section>
@@ -914,6 +1035,8 @@ _ADMIN_HTML = """<!doctype html>
     let activeJobId = null;
     let netdiskPage = 1;
     let netdiskHasMore = false;
+    let baiduAuthPoll = null;
+    let baiduHasToken = false;
     apiKeyInput.value = localStorage.getItem("stockDataAdminKey") || "";
     apiKeyInput.addEventListener("input", () => localStorage.setItem("stockDataAdminKey", apiKeyInput.value));
     $("netdiskLimit").value = localStorage.getItem("stockDataNetdiskLimit") || "100";
@@ -995,9 +1118,28 @@ _ADMIN_HTML = """<!doctype html>
       if (status === "failed") return "pill bad";
       return "pill";
     }
+    function renderBaiduAuth(settings) {
+      const system = settings.system;
+      const auth = settings.baidu_auth;
+      const configured = !!(system.baidu_app_key_configured && system.baidu_app_secret_configured);
+      baiduHasToken = !!auth.has_token;
+      $("baiduAuthStatus").className = auth.has_token ? (auth.is_expiring ? "pill warn" : "pill ok") : "pill bad";
+      $("baiduAuthStatus").textContent = auth.has_token ? (auth.is_expiring ? "百度授权即将过期" : "百度已授权") : "百度未授权";
+      $("baiduAuthExpires").textContent = auth.expires_at ? `到期 ${formatTime(auth.expires_at)}` : "无到期时间";
+      $("authorizeBaiduBtn").disabled = !configured;
+      $("authorizeBaiduBtn").textContent = auth.has_token ? "重新授权" : "百度授权";
+      $("loadNetdiskBtn").disabled = !baiduHasToken;
+      $("parentDirBtn").disabled = !baiduHasToken;
+      if (!configured) {
+        $("authMessage").textContent = "未配置 BAIDU_APP_KEY / BAIDU_APP_SECRET";
+      } else if ($("authMessage").textContent === "未配置 BAIDU_APP_KEY / BAIDU_APP_SECRET") {
+        $("authMessage").textContent = "";
+      }
+    }
     function renderSystem(settings) {
       const system = settings.system;
       const auth = settings.baidu_auth;
+      renderBaiduAuth(settings);
       const rows = [
         ["Data Root", system.data_root],
         ["Parquet", system.parquet_root],
@@ -1005,9 +1147,13 @@ _ADMIN_HTML = """<!doctype html>
         ["Raw Cache", system.baidu_cache_dir],
         ["Logs", system.logs_dir],
         ["Server Mode", system.server_mode ? "on" : "off"],
+        ["Baidu App Key", system.baidu_app_key_configured ? "configured" : "missing"],
+        ["Baidu App Secret", system.baidu_app_secret_configured ? "configured" : "missing"],
         ["Baidu Token", auth.has_token ? "has token" : "missing"],
         ["Refresh Token", auth.has_refresh_token ? "yes" : "no"],
-        ["Token Expiring", auth.is_expiring ? "yes" : "no"]
+        ["Token Expiring", auth.is_expiring ? "yes" : "no"],
+        ["Baidu Scope", system.baidu_scope || ""],
+        ["Redirect URI", system.baidu_redirect_uri || "auto"]
       ];
       $("systemInfo").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v ?? ""}</dd>`).join("");
     }
@@ -1091,6 +1237,13 @@ _ADMIN_HTML = """<!doctype html>
       }).join("") : `<tr><td colspan="7" class="muted">暂无文件</td></tr>`;
     }
     async function loadNetdisk(path = $("netdiskPath").value, page = netdiskPage) {
+      if (!baiduHasToken) {
+        $("netdiskMessage").textContent = "百度未授权";
+        $("netdiskBody").innerHTML = `<tr><td colspan="7" class="muted">百度未授权</td></tr>`;
+        $("prevPageBtn").disabled = true;
+        $("nextPageBtn").disabled = true;
+        return {entries: [], pagination: {page: 1, limit: Number($("netdiskLimit").value || 100), has_more: false}};
+      }
       const sourceId = $("sourceId").value.trim() || "baidu-main";
       const targetPath = (path || "/A股_分时数据").trim();
       const limit = Number($("netdiskLimit").value || 100);
@@ -1128,7 +1281,59 @@ _ADMIN_HTML = """<!doctype html>
         renderStatus(await api("/admin/api/sync/status", {method: "GET"}));
       } catch {}
     }
+    async function pollBaiduAuth(popup = null) {
+      if (baiduAuthPoll) clearInterval(baiduAuthPoll);
+      let attempts = 0;
+      baiduAuthPoll = setInterval(async () => {
+        attempts += 1;
+        try {
+          const settings = await api("/admin/api/settings", {method: "GET"});
+          renderSystem(settings);
+          if (settings.baidu_auth && settings.baidu_auth.has_token) {
+            clearInterval(baiduAuthPoll);
+            baiduAuthPoll = null;
+            $("authMessage").textContent = "授权已更新";
+            try { await loadNetdisk($("netdiskPath").value, 1); } catch {}
+          } else if (attempts >= 150 || (popup && popup.closed)) {
+            clearInterval(baiduAuthPoll);
+            baiduAuthPoll = null;
+            $("authMessage").textContent = attempts >= 150 ? "授权等待超时" : "授权窗口已关闭";
+          }
+        } catch {}
+      }, 2000);
+    }
+    async function startBaiduAuthorization() {
+      const button = $("authorizeBaiduBtn");
+      button.disabled = true;
+      $("authMessage").textContent = "正在打开百度授权窗口";
+      try {
+        const data = await api("/admin/api/baidu/oauth/start", {method: "POST", body: "{}"});
+        const popup = window.open(data.authorize_url, "baiduOAuth", "width=760,height=780");
+        if (!popup) {
+          $("authMessage").innerHTML = `弹窗被阻止，<a href="${escapeHtml(data.authorize_url)}" target="_blank">打开授权页面</a>`;
+          pollBaiduAuth();
+          return;
+        }
+        $("authMessage").textContent = "等待百度授权完成";
+        pollBaiduAuth(popup);
+      } catch (err) {
+        $("authMessage").textContent = err.message;
+      } finally {
+        button.disabled = false;
+      }
+    }
+    window.addEventListener("message", async (event) => {
+      if (event.origin !== window.location.origin) return;
+      if (!event.data || event.data.type !== "baidu-oauth") return;
+      if (baiduAuthPoll) {
+        clearInterval(baiduAuthPoll);
+        baiduAuthPoll = null;
+      }
+      $("authMessage").textContent = event.data.status === "success" ? "授权已完成" : "授权失败";
+      await refreshAll();
+    });
     $("refreshBtn").addEventListener("click", refreshAll);
+    $("authorizeBaiduBtn").addEventListener("click", startBaiduAuthorization);
     $("loadNetdiskBtn").addEventListener("click", async () => {
       try {
         await loadNetdisk($("netdiskPath").value, 1);

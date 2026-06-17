@@ -1,4 +1,6 @@
 import datetime as dt
+import json
+import urllib.parse
 
 from fastapi.testclient import TestClient
 
@@ -96,6 +98,27 @@ class FakeBaiduListClient:
         return {"list": items[start : start + limit], "total": len(items)}
 
 
+class FakeOauthResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class FakeOauthSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.posts = []
+
+    def post(self, url, **kwargs):
+        self.posts.append({"url": url, **kwargs})
+        return FakeOauthResponse(self.payload)
+
+
 def _client(tmp_path):
     app = create_app(Settings(data_root=tmp_path / "data"))
     fake = FakeSyncManager()
@@ -109,6 +132,8 @@ def test_admin_page_and_settings_roundtrip(tmp_path):
     assert page.status_code == 200
     assert "Stock Data Service 管理台" in page.text
     assert 'href="/admin/calendar"' in page.text
+    assert 'id="baiduAuthStatus"' in page.text
+    assert 'id="authorizeBaiduBtn"' in page.text
     assert "CALENDAR_COLOR_HAS_DATA" not in page.text
 
     calendar_page = client.get("/admin/calendar")
@@ -158,6 +183,51 @@ def test_admin_page_and_settings_roundtrip(tmp_path):
     assert saved.status_code == 200
     assert saved.json()["sync_defaults"]["symbols"] == ["sh600000", "sz000001"]
     assert client.get("/admin/api/settings").json()["sync_defaults"]["timeframe"] == "5m"
+
+
+def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):
+    token_file = tmp_path / "baidu_token.json"
+    settings = Settings(
+        data_root=tmp_path / "data",
+        baidu_app_key="app-key",
+        baidu_app_secret="app-secret",
+        baidu_token_file=token_file,
+        baidu_redirect_uri="http://testserver/admin/api/baidu/oauth/callback",
+    )
+    app = create_app(settings)
+    fake_session = FakeOauthSession({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600})
+    app.state.baidu_oauth_session_factory = lambda: fake_session
+    client = TestClient(app)
+
+    start = client.post("/admin/api/baidu/oauth/start", json={})
+
+    assert start.status_code == 200
+    payload = start.json()
+    parsed = urllib.parse.urlparse(payload["authorize_url"])
+    query = urllib.parse.parse_qs(parsed.query)
+    assert parsed.geturl().startswith("https://openapi.baidu.com/oauth/2.0/authorize?")
+    assert query["client_id"] == ["app-key"]
+    assert query["redirect_uri"] == [settings.baidu_redirect_uri]
+    assert query["scope"] == ["basic,netdisk"]
+    assert query["code_challenge_method"] == ["S256"]
+
+    callback = client.get(
+        "/admin/api/baidu/oauth/callback",
+        params={"code": "auth-code", "state": query["state"][0]},
+    )
+
+    assert callback.status_code == 200
+    assert "百度授权成功" in callback.text
+    saved = json.loads(token_file.read_text(encoding="utf-8"))
+    assert saved["access_token"] == "access"
+    assert saved["refresh_token"] == "refresh"
+    assert "expires_at" in saved
+    assert fake_session.posts[0]["url"] == "https://openapi.baidu.com/oauth/2.0/token"
+    assert fake_session.posts[0]["data"]["grant_type"] == "authorization_code"
+    assert fake_session.posts[0]["data"]["code"] == "auth-code"
+    assert fake_session.posts[0]["data"]["client_secret"] == "app-secret"
+    assert fake_session.posts[0]["data"]["redirect_uri"] == settings.baidu_redirect_uri
+    assert fake_session.posts[0]["data"]["code_verifier"]
 
 
 def test_admin_coverage_calendar_marks_data_missing_and_non_trading(tmp_path):

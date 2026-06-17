@@ -57,6 +57,8 @@ BAIDU_APP_KEY=
 BAIDU_APP_SECRET=
 BAIDU_TOKEN_FILE=./baidu_token.json
 BAIDU_CACHE_DIR=./data/raw/baidu
+BAIDU_REDIRECT_URI=
+BAIDU_SCOPE=basic,netdisk
 ```
 
 配置含义：
@@ -74,6 +76,8 @@ BAIDU_CACHE_DIR=./data/raw/baidu
 | `BAIDU_APP_SECRET` | 百度网盘开放平台应用 secret。 |
 | `BAIDU_TOKEN_FILE` | 百度授权 token 文件路径。 |
 | `BAIDU_CACHE_DIR` | 百度网盘原始 zip 文件缓存目录。 |
+| `BAIDU_REDIRECT_URI` | 百度 OAuth 回调地址。为空时使用当前服务的 `/admin/api/baidu/oauth/callback`。生产部署建议显式配置为百度开放平台登记的完整 URL。 |
+| `BAIDU_SCOPE` | 百度 OAuth 授权范围，默认 `basic,netdisk`。 |
 
 ## 命令行使用
 
@@ -159,7 +163,7 @@ http://127.0.0.1:8000/admin
 管理页面支持：
 
 - 保存默认同步参数。
-- 查看百度授权状态。
+- 查看百度授权状态，并在未授权时弹出百度 OAuth 页面完成授权。
 - 分页浏览百度网盘目录。
 - 根据 `size`、`md5`、`server_mtime` 判断远端文件是否已同步或有更新。
 - 启动完整同步任务。

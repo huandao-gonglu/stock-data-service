@@ -39,6 +39,8 @@ class Settings:
     baidu_app_secret: str | None = None
     baidu_token_file: Path = Path("./baidu_token.json")
     baidu_cache_dir: Path = Path("./data/raw/baidu")
+    baidu_redirect_uri: str | None = None
+    baidu_scope: str = "basic,netdisk"
 
     @property
     def parquet_root(self) -> Path:
@@ -70,6 +72,8 @@ class Settings:
             baidu_app_secret=os.getenv("BAIDU_APP_SECRET") or None,
             baidu_token_file=Path(os.getenv("BAIDU_TOKEN_FILE", "./baidu_token.json")),
             baidu_cache_dir=Path(os.getenv("BAIDU_CACHE_DIR", "./data/raw/baidu")),
+            baidu_redirect_uri=os.getenv("BAIDU_REDIRECT_URI") or None,
+            baidu_scope=os.getenv("BAIDU_SCOPE", "basic,netdisk"),
         )
 
 
