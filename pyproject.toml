@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-data-service"
+version = "0.1.0"
+description = "基于 DuckDB、Parquet 和 FastAPI 的独立 A 股行情数据服务"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.30",
+  "duckdb>=1.1",
+  "pyarrow>=16",
+  "pandas>=2.2",
+  "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "httpx>=0.27",
+  "freezegun>=1.5",
+  "responses>=0.25",
+]
+
+[project.scripts]
+stock-data = "stock_data_service.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+markers = [
+  "live: tests that require real Baidu credentials and network access",
+]
