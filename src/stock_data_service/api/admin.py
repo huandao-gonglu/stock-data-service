@@ -31,7 +31,7 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
     router = APIRouter(dependencies=[Depends(admin_auth_dependency)])
     oauth_states = BaiduOAuthStateStore()
 
-    @callback_router.get("/admin/api/baidu/oauth/callback", response_class=HTMLResponse, name="baidu_oauth_callback")
+    @callback_router.get("/callback", response_class=HTMLResponse, name="baidu_oauth_callback")
     def baidu_oauth_callback(
         request: Request,
         code: str | None = Query(default=None),
@@ -65,7 +65,7 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
         return Response(status_code=204)
 
     @router.get("/admin/api/settings")
-    def get_settings() -> dict:
+    def get_settings(request: Request) -> dict:
         store = AdminSettingsStore(settings)
         token_manager = TokenManager(
             token_file=settings.baidu_token_file,
@@ -88,6 +88,7 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
                 "baidu_token_file": str(settings.baidu_token_file),
                 "baidu_token_file_exists": settings.baidu_token_file.exists(),
                 "baidu_redirect_uri": settings.baidu_redirect_uri,
+                "baidu_effective_redirect_uri": _baidu_redirect_uri(request, settings),
                 "baidu_scope": settings.baidu_scope,
             },
             "sync_defaults": asdict(store.load()),
@@ -1153,7 +1154,7 @@ _ADMIN_HTML = """<!doctype html>
         ["Refresh Token", auth.has_refresh_token ? "yes" : "no"],
         ["Token Expiring", auth.is_expiring ? "yes" : "no"],
         ["Baidu Scope", system.baidu_scope || ""],
-        ["Redirect URI", system.baidu_redirect_uri || "auto"]
+        ["Redirect URI", system.baidu_effective_redirect_uri || system.baidu_redirect_uri || "auto"]
       ];
       $("systemInfo").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v ?? ""}</dd>`).join("");
     }

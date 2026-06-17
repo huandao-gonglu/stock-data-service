@@ -76,7 +76,7 @@ BAIDU_SCOPE=basic,netdisk
 | `BAIDU_APP_SECRET` | 百度网盘开放平台应用 secret。 |
 | `BAIDU_TOKEN_FILE` | 百度授权 token 文件路径。 |
 | `BAIDU_CACHE_DIR` | 百度网盘原始 zip 文件缓存目录。 |
-| `BAIDU_REDIRECT_URI` | 百度 OAuth 回调地址。为空时使用当前服务的 `/admin/api/baidu/oauth/callback`。生产部署建议显式配置为百度开放平台登记的完整 URL。 |
+| `BAIDU_REDIRECT_URI` | 百度 OAuth 回调地址。为空时使用当前服务的 `/callback`。必须和百度开放平台登记的 URL 完全一致，包括协议、域名/IP、端口和路径。 |
 | `BAIDU_SCOPE` | 百度 OAuth 授权范围，默认 `basic,netdisk`。 |
 
 ## 命令行使用
@@ -171,6 +171,8 @@ http://127.0.0.1:8000/admin
 - 请求停止正在运行的同步任务。
 - 查看当前任务和近期任务状态。
 - 查看覆盖率日历。
+
+百度授权回调地址必须和百度开放平台配置完全一致。原 `StockK` 桌面授权默认使用 `http://localhost:53682/callback`；datasrv 管理页默认使用当前服务地址的 `/callback`，例如 `http://127.0.0.1:8000/callback` 或 `https://your-domain.example/callback`。如果继续复用原百度应用，需要在百度开放平台新增 datasrv 的回调地址，或把 `BAIDU_REDIRECT_URI` 配成已登记的地址并确保该地址能访问到当前 datasrv 的回调接口。
 
 本地模式下默认不需要鉴权。服务模式下，管理页面和管理 API 需要 `ADMIN_API_KEY`，页面会通过 `X-API-Key` 请求头发送管理 key。
 

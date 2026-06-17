@@ -192,7 +192,7 @@ def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):
         baidu_app_key="app-key",
         baidu_app_secret="app-secret",
         baidu_token_file=token_file,
-        baidu_redirect_uri="http://testserver/admin/api/baidu/oauth/callback",
+        baidu_redirect_uri="http://testserver/callback",
     )
     app = create_app(settings)
     fake_session = FakeOauthSession({"access_token": "access", "refresh_token": "refresh", "expires_in": 3600})
@@ -212,7 +212,7 @@ def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):
     assert query["code_challenge_method"] == ["S256"]
 
     callback = client.get(
-        "/admin/api/baidu/oauth/callback",
+        "/callback",
         params={"code": "auth-code", "state": query["state"][0]},
     )
 
@@ -228,6 +228,41 @@ def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):
     assert fake_session.posts[0]["data"]["client_secret"] == "app-secret"
     assert fake_session.posts[0]["data"]["redirect_uri"] == settings.baidu_redirect_uri
     assert fake_session.posts[0]["data"]["code_verifier"]
+
+
+def test_admin_baidu_oauth_rejects_removed_callback_alias(tmp_path):
+    settings = Settings(
+        data_root=tmp_path / "data",
+        baidu_app_key="app-key",
+        baidu_app_secret="app-secret",
+        baidu_token_file=tmp_path / "baidu_token.json",
+    )
+    client = TestClient(create_app(settings))
+
+    response = client.get("/admin/api/baidu/oauth/callback", params={"code": "auth-code", "state": "state"})
+
+    assert response.status_code == 404
+
+
+def test_admin_baidu_oauth_default_redirect_uses_callback_path(tmp_path):
+    settings = Settings(
+        data_root=tmp_path / "data",
+        baidu_app_key="app-key",
+        baidu_app_secret="app-secret",
+        baidu_token_file=tmp_path / "baidu_token.json",
+    )
+    client = TestClient(create_app(settings))
+
+    settings_response = client.get("/admin/api/settings")
+    start_response = client.post("/admin/api/baidu/oauth/start", json={})
+
+    assert settings_response.status_code == 200
+    assert settings_response.json()["system"]["baidu_effective_redirect_uri"] == "http://testserver/callback"
+    assert start_response.status_code == 200
+    payload = start_response.json()
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(payload["authorize_url"]).query)
+    assert payload["redirect_uri"] == "http://testserver/callback"
+    assert query["redirect_uri"] == ["http://testserver/callback"]
 
 
 def test_admin_coverage_calendar_marks_data_missing_and_non_trading(tmp_path):
