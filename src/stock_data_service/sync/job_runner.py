@@ -532,24 +532,37 @@ class BaiduSyncJobRunner:
                     archive_committed = 0
                     archive_failed = 0
                     archive_processed = 0
+                    archive_requested = len(normalized_symbols)
+                    archive_present = len(normalized_symbols)
+                    archive_missing = 0
 
                     def report_ingest_progress(symbol: str, status_result) -> None:
                         nonlocal ingest_processed, archive_committed, archive_failed, archive_processed
+                        nonlocal archive_requested, archive_present, archive_missing
+                        if status_result.archive_requested_count is not None:
+                            archive_requested = status_result.archive_requested_count
+                        if status_result.archive_present_count is not None:
+                            archive_present = status_result.archive_present_count
+                        if status_result.archive_missing_count is not None:
+                            archive_missing = status_result.archive_missing_count
                         if status_result.status != "ingesting":
-                            ingest_processed += 1
-                            archive_processed += 1
+                            event_count = max(int(getattr(status_result, "count", 1) or 0), 0)
+                            ingest_processed += event_count
+                            if symbol:
+                                archive_processed += event_count
                             if status_result.committed:
-                                archive_committed += 1
+                                archive_committed += event_count
                             elif not status_result.skipped:
-                                archive_failed += 1
+                                archive_failed += event_count
                         current_ingest_total = max(
                             ingest_total,
                             downloaded * len(normalized_symbols),
                             ingest_processed,
                         )
+                        stage_symbol = symbol or ("归档未包含" if status_result.status == "symbol_missing" else status_result.status)
                         _report_progress(
                             progress_callback,
-                            f"入库 {symbol}",
+                            f"入库 {stage_symbol}",
                             _ingest_progress_percent(ingest_processed, current_ingest_total),
                             counts=_counts_payload(
                                 scanned,
@@ -560,8 +573,11 @@ class BaiduSyncJobRunner:
                                 ingest_processed_count=ingest_processed,
                                 ingest_total_count=current_ingest_total,
                                 current_archive_ingest_processed_count=archive_processed,
-                                current_archive_ingest_total_count=len(normalized_symbols),
-                                current_ingest_symbol=symbol,
+                                current_archive_ingest_total_count=archive_present,
+                                current_archive_requested_count=archive_requested,
+                                current_archive_present_count=archive_present,
+                                current_archive_missing_count=archive_missing,
+                                current_ingest_symbol=symbol or None,
                                 current_ingest_path=result.remote_path,
                                 current_ingest_status=status_result.status,
                             ),
@@ -592,7 +608,10 @@ class BaiduSyncJobRunner:
                             ingest_processed_count=ingest_processed,
                             ingest_total_count=current_ingest_total,
                             current_archive_ingest_processed_count=archive_processed,
-                            current_archive_ingest_total_count=len(normalized_symbols),
+                            current_archive_ingest_total_count=archive_present,
+                            current_archive_requested_count=archive_requested,
+                            current_archive_present_count=archive_present,
+                            current_archive_missing_count=archive_missing,
                             current_ingest_path=result.remote_path,
                         ),
                     )
@@ -821,19 +840,32 @@ class BaiduSyncJobRunner:
             archive_committed = 0
             archive_failed = 0
             archive_processed = 0
+            archive_requested = len(normalized_symbols)
+            archive_present = len(normalized_symbols)
+            archive_missing = 0
 
             def report_ingest_progress(symbol: str, status_result) -> None:
                 nonlocal ingest_processed, archive_committed, archive_failed, archive_processed
+                nonlocal archive_requested, archive_present, archive_missing
+                if status_result.archive_requested_count is not None:
+                    archive_requested = status_result.archive_requested_count
+                if status_result.archive_present_count is not None:
+                    archive_present = status_result.archive_present_count
+                if status_result.archive_missing_count is not None:
+                    archive_missing = status_result.archive_missing_count
                 if status_result.status != "ingesting":
-                    ingest_processed += 1
-                    archive_processed += 1
+                    event_count = max(int(getattr(status_result, "count", 1) or 0), 0)
+                    ingest_processed += event_count
+                    if symbol:
+                        archive_processed += event_count
                     if status_result.committed:
-                        archive_committed += 1
+                        archive_committed += event_count
                     elif not status_result.skipped:
-                        archive_failed += 1
+                        archive_failed += event_count
+                stage_symbol = symbol or ("归档未包含" if status_result.status == "symbol_missing" else status_result.status)
                 _report_progress(
                     progress_callback,
-                    f"入库 {symbol}",
+                    f"入库 {stage_symbol}",
                     _ingest_progress_percent(ingest_processed, ingest_total),
                     counts=_counts_payload(
                         scanned,
@@ -844,8 +876,11 @@ class BaiduSyncJobRunner:
                         ingest_processed_count=ingest_processed,
                         ingest_total_count=ingest_total,
                         current_archive_ingest_processed_count=archive_processed,
-                        current_archive_ingest_total_count=ingest_total,
-                        current_ingest_symbol=symbol,
+                        current_archive_ingest_total_count=archive_present,
+                        current_archive_requested_count=archive_requested,
+                        current_archive_present_count=archive_present,
+                        current_archive_missing_count=archive_missing,
+                        current_ingest_symbol=symbol or None,
                         current_ingest_path=result.remote_path,
                         current_ingest_status=status_result.status,
                     ),
@@ -875,7 +910,10 @@ class BaiduSyncJobRunner:
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=archive_processed,
-                    current_archive_ingest_total_count=ingest_total,
+                    current_archive_ingest_total_count=archive_present,
+                    current_archive_requested_count=archive_requested,
+                    current_archive_present_count=archive_present,
+                    current_archive_missing_count=archive_missing,
                     current_ingest_path=result.remote_path,
                 ),
             )
@@ -901,7 +939,10 @@ class BaiduSyncJobRunner:
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=archive_processed,
-                    current_archive_ingest_total_count=ingest_total,
+                    current_archive_ingest_total_count=archive_present,
+                    current_archive_requested_count=archive_requested,
+                    current_archive_present_count=archive_present,
+                    current_archive_missing_count=archive_missing,
                 ),
             )
             logger.info(
@@ -1104,6 +1145,9 @@ def _counts_payload(
     ingest_total_count: int | None = None,
     current_archive_ingest_processed_count: int = 0,
     current_archive_ingest_total_count: int | None = None,
+    current_archive_requested_count: int | None = None,
+    current_archive_present_count: int | None = None,
+    current_archive_missing_count: int | None = None,
     current_ingest_symbol: str | None = None,
     current_ingest_path: str | None = None,
     current_ingest_status: str | None = None,
@@ -1122,12 +1166,15 @@ def _counts_payload(
     payload["current_archive_ingest_processed_count"] = current_archive_ingest_processed_count
     if current_archive_ingest_total_count is not None:
         payload["current_archive_ingest_total_count"] = current_archive_ingest_total_count
-    if current_ingest_symbol is not None:
-        payload["current_ingest_symbol"] = current_ingest_symbol
-    if current_ingest_path is not None:
-        payload["current_ingest_path"] = current_ingest_path
-    if current_ingest_status is not None:
-        payload["current_ingest_status"] = current_ingest_status
+    if current_archive_requested_count is not None:
+        payload["current_archive_requested_count"] = current_archive_requested_count
+    if current_archive_present_count is not None:
+        payload["current_archive_present_count"] = current_archive_present_count
+    if current_archive_missing_count is not None:
+        payload["current_archive_missing_count"] = current_archive_missing_count
+    payload["current_ingest_symbol"] = current_ingest_symbol
+    payload["current_ingest_path"] = current_ingest_path
+    payload["current_ingest_status"] = current_ingest_status
     return payload
 
 

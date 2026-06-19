@@ -84,6 +84,28 @@ def test_local_sync_job_ingests_multiple_symbols_from_one_archive(tmp_path):
     ]
 
 
+def test_local_sync_missing_symbol_in_one_archive_does_not_skip_later_archive(tmp_path):
+    raw = tmp_path / "raw/A股K线分时数据/1分钟"
+    raw.mkdir(parents=True)
+    (raw / "20241220_1min.zip").write_bytes(make_zip(sample_rows(symbol="sz000001"), member="sz000001.csv"))
+    (raw / "20241223_1min.zip").write_bytes(make_zip(sample_rows(symbol="sh600000"), member="sh600000.csv"))
+    metadata = SyncMetadata(tmp_path / "meta.duckdb")
+
+    result = LocalSyncJobRunner(raw_root=tmp_path / "raw", parquet_root=tmp_path / "parquet", metadata=metadata).run(
+        timeframe=Timeframe.M1,
+        start=dt.date(2024, 12, 20),
+        end=dt.date(2024, 12, 23),
+        symbols=["sh600000"],
+    )
+
+    assert result.ingested_count == 1
+    assert result.failed_count == 0
+    assert metadata.fetchall("SELECT remote_path, symbol, status FROM file_ingests ORDER BY remote_path") == [
+        ("/A股K线分时数据/1分钟/20241220_1min.zip", "sh600000", "symbol_missing"),
+        ("/A股K线分时数据/1分钟/20241223_1min.zip", "sh600000", "committed"),
+    ]
+
+
 def test_sync_job_continues_on_corrupted_zip(tmp_path):
     raw = tmp_path / "raw/A股_分时数据/1分钟"
     raw.mkdir(parents=True)

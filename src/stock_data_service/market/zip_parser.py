@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +24,32 @@ class ParseResult:
     dataframe: pd.DataFrame
     status: ParseStatus
     error_message: str | None = None
+    parse_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ArchiveSymbolSelection:
+    present_symbols: list[str]
+    missing_symbols: list[str]
+    member_index: dict[str, str]
 
 
 class ZipBarParser:
+    def symbol_member_index(self, zip_path: str | Path) -> dict[str, str]:
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            return self._build_member_index(archive.namelist())
+
+    def select_archive_symbols(self, zip_path: str | Path, symbols: list[str]) -> ArchiveSymbolSelection:
+        normalized_symbols = [normalize_symbol(symbol) for symbol in symbols]
+        member_index = self.symbol_member_index(zip_path)
+        present_symbols = [symbol for symbol in normalized_symbols if symbol in member_index]
+        missing_symbols = [symbol for symbol in normalized_symbols if symbol not in member_index]
+        return ArchiveSymbolSelection(
+            present_symbols=present_symbols,
+            missing_symbols=missing_symbols,
+            member_index=member_index,
+        )
+
     def parse(
         self,
         zip_bytes: bytes | io.BytesIO,
@@ -72,17 +96,19 @@ class ZipBarParser:
         end: dt.datetime | None = None,
         source_path: str | None = None,
         source: str = "baidu_netdisk",
+        member_index: dict[str, str] | None = None,
     ) -> Iterator[tuple[str, ParseResult]]:
         normalized_symbols = [normalize_symbol(symbol) for symbol in symbols]
         try:
             with zipfile.ZipFile(zip_path, "r") as archive:
-                member_index = self._build_member_index(archive.namelist())
+                member_index = member_index or self._build_member_index(archive.namelist())
                 for normalized in normalized_symbols:
                     member = member_index.get(normalized)
                     if member is None:
                         yield normalized, ParseResult(_empty(), "symbol_missing", f"{normalized} CSV not found")
                         continue
                     try:
+                        parse_started = time.perf_counter()
                         content = archive.read(member)
                         parsed = self._parse_csv(
                             content,
@@ -93,11 +119,21 @@ class ZipBarParser:
                             source=source,
                         )
                     except zipfile.BadZipFile as exc:
-                        yield normalized, ParseResult(_empty(), "corrupted_zip", str(exc))
+                        yield normalized, ParseResult(
+                            _empty(),
+                            "corrupted_zip",
+                            str(exc),
+                            time.perf_counter() - parse_started,
+                        )
                     except Exception as exc:
-                        yield normalized, ParseResult(_empty(), "parse_failed", str(exc))
+                        yield normalized, ParseResult(
+                            _empty(),
+                            "parse_failed",
+                            str(exc),
+                            time.perf_counter() - parse_started,
+                        )
                     else:
-                        yield normalized, ParseResult(parsed, "ok")
+                        yield normalized, ParseResult(parsed, "ok", parse_seconds=time.perf_counter() - parse_started)
         except zipfile.BadZipFile as exc:
             for normalized in normalized_symbols:
                 yield normalized, ParseResult(_empty(), "corrupted_zip", str(exc))

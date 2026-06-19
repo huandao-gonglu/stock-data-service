@@ -11,6 +11,7 @@ from conftest import make_zip, sample_rows
 from stock_data_service.baidu.pan_client import BaiduFileMeta
 from stock_data_service.market.path_strategy import BaiduStockKPathStrategy
 from stock_data_service.market.timeframe import Timeframe
+from stock_data_service.market.zip_parser import ZipBarParser
 from stock_data_service.storage.duckdb_repository import DuckDBRepository
 from stock_data_service.storage.sync_metadata import SyncMetadata
 from stock_data_service.sync.job_runner import BaiduSyncJobRunner, SyncCancelled
@@ -174,6 +175,52 @@ def test_baidu_sync_skips_missing_symbol_without_failing_job(tmp_path):
         "completed",
         0,
     )
+
+
+def test_baidu_sync_batches_missing_symbols_and_only_parses_present_symbols(tmp_path, monkeypatch):
+    remote_path = BaiduStockKPathStrategy().candidates(Timeframe.M1, dt.date(2024, 12, 20))[0].remote_path
+    metadata = SyncMetadata(tmp_path / "meta.duckdb")
+    progress = []
+    parsed_symbol_batches = []
+    original_iter_parse_archive = ZipBarParser.iter_parse_archive
+
+    def spy_iter_parse_archive(self, zip_path, symbols, **kwargs):
+        parsed_symbol_batches.append(list(symbols))
+        yield from original_iter_parse_archive(self, zip_path, symbols, **kwargs)
+
+    monkeypatch.setattr(ZipBarParser, "iter_parse_archive", spy_iter_parse_archive)
+
+    result = BaiduSyncJobRunner(
+        client=FakeBaiduClient({remote_path: make_zip(sample_rows(symbol="sh600000"), member="sh600000.csv")}),
+        cache_dir=tmp_path / "raw" / "baidu",
+        parquet_root=tmp_path / "parquet",
+        metadata=metadata,
+    ).run(
+        timeframe=Timeframe.M1,
+        start=dt.date(2024, 12, 20),
+        end=dt.date(2024, 12, 20),
+        symbols=["sh600000", "sz000001", "sh600004"],
+        progress_callback=lambda stage, percent, download, counts=None: progress.append(
+            {"stage": stage, "percent": percent, "counts": counts}
+        ),
+    )
+
+    assert result.ingested_count == 1
+    assert result.failed_count == 0
+    assert parsed_symbol_batches == [["sh600000"]]
+    assert metadata.fetchall("SELECT symbol, status FROM file_ingests ORDER BY symbol") == [
+        ("sh600000", "committed"),
+        ("sh600004", "symbol_missing"),
+        ("sz000001", "symbol_missing"),
+    ]
+    assert metadata.get_archive_symbol_members(
+        source_id="baidu-main",
+        remote_path=remote_path,
+        content_hash=metadata.fetchone("SELECT content_hash FROM remote_files WHERE remote_path = ?", [remote_path])[0],
+    ) == {"sh600000": "sh600000.csv"}
+    assert any(item["counts"] and item["counts"].get("current_archive_present_count") == 1 for item in progress)
+    assert any(item["counts"] and item["counts"].get("current_archive_missing_count") == 2 for item in progress)
+    assert any(item["counts"] and item["counts"].get("ingest_processed_count") == 2 for item in progress)
 
 
 def test_baidu_sync_cancels_during_download(tmp_path):

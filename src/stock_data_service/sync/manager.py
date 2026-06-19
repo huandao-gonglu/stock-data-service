@@ -100,6 +100,9 @@ class ManagedSyncJob:
     ingest_total_count: int | None = None
     current_archive_ingest_processed_count: int = 0
     current_archive_ingest_total_count: int | None = None
+    current_archive_requested_count: int | None = None
+    current_archive_present_count: int | None = None
+    current_archive_missing_count: int = 0
     current_ingest_symbol: str | None = None
     current_ingest_path: str | None = None
     current_ingest_status: str | None = None
@@ -130,6 +133,9 @@ class ManagedSyncJob:
             "ingest_total_count": self.ingest_total_count,
             "current_archive_ingest_processed_count": self.current_archive_ingest_processed_count,
             "current_archive_ingest_total_count": self.current_archive_ingest_total_count,
+            "current_archive_requested_count": self.current_archive_requested_count,
+            "current_archive_present_count": self.current_archive_present_count,
+            "current_archive_missing_count": self.current_archive_missing_count,
             "current_ingest_symbol": self.current_ingest_symbol,
             "current_ingest_path": self.current_ingest_path,
             "current_ingest_status": self.current_ingest_status,
@@ -323,10 +329,7 @@ class SyncJobManager:
             if job.status != "stopping" and not preserve_ingest_stage:
                 job.stage = stage
             next_percent = max(0, min(percent, 100))
-            if preserve_ingest_stage:
-                job.progress_percent = max(job.progress_percent, next_percent)
-            else:
-                job.progress_percent = next_percent
+            job.progress_percent = max(job.progress_percent, next_percent)
             if counts is not None:
                 if "scanned_count" in counts:
                     job.scanned_count = int(counts.get("scanned_count") or 0)
@@ -350,6 +353,12 @@ class SyncJobManager:
                     job.current_archive_ingest_total_count = _optional_int(
                         counts.get("current_archive_ingest_total_count")
                     )
+                if "current_archive_requested_count" in counts:
+                    job.current_archive_requested_count = _optional_int(counts.get("current_archive_requested_count"))
+                if "current_archive_present_count" in counts:
+                    job.current_archive_present_count = _optional_int(counts.get("current_archive_present_count"))
+                if "current_archive_missing_count" in counts:
+                    job.current_archive_missing_count = int(counts.get("current_archive_missing_count") or 0)
                 if "current_ingest_symbol" in counts:
                     job.current_ingest_symbol = _optional_text(counts.get("current_ingest_symbol"))
                 if "current_ingest_path" in counts:

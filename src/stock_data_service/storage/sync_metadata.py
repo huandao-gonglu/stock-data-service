@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import pandas as pd
 
 _DB_LOCKS: dict[Path, threading.RLock] = {}
 _DB_LOCKS_GUARD = threading.Lock()
@@ -260,6 +261,133 @@ class SyncMetadata:
                 [source_id, remote_path, timeframe, symbol, content_hash, status, now, error_message],
             )
 
+    def mark_file_ingest_status_many(
+        self,
+        *,
+        source_id: str,
+        remote_path: str,
+        timeframe: str,
+        symbols: list[str],
+        status: str,
+        error_message: str | None = None,
+        content_hash: str | None = None,
+    ) -> int:
+        unique_symbols = list(dict.fromkeys(symbols))
+        if not unique_symbols:
+            return 0
+        now = _now()
+        rows = pd.DataFrame(
+            {
+                "source_id": source_id,
+                "remote_path": remote_path,
+                "timeframe": timeframe,
+                "symbol": unique_symbols,
+                "content_hash": content_hash,
+                "status": status,
+                "ingested_at": now,
+                "error_message": error_message,
+            }
+        )
+        with self.connect() as con:
+            con.register("bulk_file_ingest_status", rows)
+            con.execute(
+                """
+                DELETE FROM file_ingests
+                WHERE source_id = ? AND remote_path = ? AND timeframe = ?
+                  AND symbol IN (SELECT symbol FROM bulk_file_ingest_status)
+                """,
+                [source_id, remote_path, timeframe],
+            )
+            con.execute(
+                """
+                INSERT INTO file_ingests
+                (source_id, remote_path, timeframe, symbol, start_ts, end_ts, row_count,
+                 expected_row_count, content_hash, parquet_path, status, ingested_at,
+                 committed_at, error_message)
+                SELECT source_id, remote_path, timeframe, symbol, NULL, NULL, 0, NULL,
+                       content_hash, NULL, status, ingested_at, NULL, error_message
+                FROM bulk_file_ingest_status
+                """
+            )
+        return len(unique_symbols)
+
+    def get_archive_symbol_members(
+        self,
+        *,
+        source_id: str,
+        remote_path: str,
+        content_hash: str | None,
+    ) -> dict[str, str] | None:
+        with self.connect() as con:
+            index_row = con.execute(
+                """
+                SELECT content_hash
+                FROM archive_indexes
+                WHERE source_id = ? AND remote_path = ?
+                """,
+                [source_id, remote_path],
+            ).fetchone()
+            if index_row is None or index_row[0] != content_hash:
+                return None
+            rows = con.execute(
+                """
+                SELECT symbol, member_name
+                FROM archive_symbol_members
+                WHERE source_id = ? AND remote_path = ?
+                """,
+                [source_id, remote_path],
+            ).fetchall()
+        return {row[0]: row[1] for row in rows}
+
+    def upsert_archive_symbol_members(
+        self,
+        *,
+        source_id: str,
+        remote_path: str,
+        content_hash: str | None,
+        members: dict[str, str],
+    ) -> int:
+        now = _now()
+        sorted_members = sorted(members.items())
+        rows = pd.DataFrame(
+            {
+                "source_id": source_id,
+                "remote_path": remote_path,
+                "symbol": [symbol for symbol, _ in sorted_members],
+                "member_name": [member_name for _, member_name in sorted_members],
+                "content_hash": content_hash,
+                "indexed_at": now,
+            }
+        )
+        with self.connect() as con:
+            con.execute(
+                "DELETE FROM archive_symbol_members WHERE source_id = ? AND remote_path = ?",
+                [source_id, remote_path],
+            )
+            con.execute(
+                "DELETE FROM archive_indexes WHERE source_id = ? AND remote_path = ?",
+                [source_id, remote_path],
+            )
+            con.execute(
+                """
+                INSERT INTO archive_indexes
+                (source_id, remote_path, content_hash, symbol_count, indexed_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [source_id, remote_path, content_hash, len(sorted_members), now],
+            )
+            if sorted_members:
+                con.register("bulk_archive_symbol_members", rows)
+                con.execute(
+                    """
+                    INSERT INTO archive_symbol_members
+                    (source_id, remote_path, symbol, member_name, content_hash, indexed_at)
+                    SELECT source_id, remote_path, symbol, member_name, content_hash, indexed_at
+                    FROM bulk_archive_symbol_members
+                    """
+                )
+        return len(sorted_members)
+
     def update_coverage_daily(
         self,
         *,
@@ -301,6 +429,35 @@ class SyncMetadata:
                     _now(),
                 ],
             )
+
+    def update_coverage_daily_many(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        now = _now()
+        frame = pd.DataFrame(rows)
+        frame["updated_at"] = now
+        with self.connect() as con:
+            con.register("bulk_coverage_daily", frame)
+            con.execute(
+                """
+                DELETE FROM coverage_daily
+                USING bulk_coverage_daily
+                WHERE coverage_daily.symbol = bulk_coverage_daily.symbol
+                  AND coverage_daily.timeframe = bulk_coverage_daily.timeframe
+                  AND coverage_daily.trade_date = bulk_coverage_daily.trade_date
+                """
+            )
+            con.execute(
+                """
+                INSERT INTO coverage_daily
+                (symbol, timeframe, trade_date, start_ts, end_ts, row_count,
+                 expected_row_count, is_complete, quality_flag, updated_at)
+                SELECT symbol, timeframe, trade_date, start_ts, end_ts, row_count,
+                       expected_row_count, is_complete, quality_flag, updated_at
+                FROM bulk_coverage_daily
+                """
+            )
+        return len(rows)
 
     def dates_requiring_sync(
         self,
@@ -588,6 +745,27 @@ _DDL = [
         committed_at TIMESTAMP,
         error_message VARCHAR,
         PRIMARY KEY (source_id, remote_path, timeframe, symbol)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS archive_indexes (
+        source_id VARCHAR NOT NULL,
+        remote_path VARCHAR NOT NULL,
+        content_hash VARCHAR,
+        symbol_count BIGINT NOT NULL,
+        indexed_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (source_id, remote_path)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS archive_symbol_members (
+        source_id VARCHAR NOT NULL,
+        remote_path VARCHAR NOT NULL,
+        symbol VARCHAR NOT NULL,
+        member_name VARCHAR NOT NULL,
+        content_hash VARCHAR,
+        indexed_at TIMESTAMP NOT NULL,
+        PRIMARY KEY (source_id, remote_path, symbol)
     )
     """,
     """

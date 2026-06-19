@@ -1178,7 +1178,7 @@ _ADMIN_HTML = """<!doctype html>
         ingesting: "处理中",
         committed: "已提交",
         skipped: "跳过",
-        symbol_missing: "未找到",
+        symbol_missing: "归档未包含",
         parse_failed: "解析失败",
         corrupted_zip: "ZIP 损坏",
         failed: "失败"
@@ -1232,10 +1232,21 @@ _ADMIN_HTML = """<!doctype html>
         $("activeStatus").textContent = active.status;
         const archiveProgress = countPair(active.scanned_count, active.planned_download_count);
         const ingestProgress = countPair(active.ingest_processed_count, active.ingest_total_count);
+        const currentArchiveRequested = active.current_archive_requested_count;
+        const currentArchivePresent = active.current_archive_present_count ?? active.current_archive_ingest_total_count;
+        const currentArchiveMissing = Number(active.current_archive_missing_count || 0);
         const currentArchiveIngestProgress = countPair(
           active.current_archive_ingest_processed_count,
-          active.current_archive_ingest_total_count
+          currentArchivePresent
         );
+        const currentArchiveParts = [`实际 ${currentArchiveIngestProgress}`];
+        if (currentArchiveRequested !== null && currentArchiveRequested !== undefined) {
+          currentArchiveParts.push(`请求 ${currentArchiveRequested}`);
+        }
+        if (currentArchiveMissing > 0) {
+          currentArchiveParts.push(`归档未包含 ${currentArchiveMissing}`);
+        }
+        const currentArchiveText = currentArchiveParts.join(" · ");
         $("activeCounts").textContent = `归档 ${archiveProgress} · 下载 ${active.downloaded_count} · 入库 ${active.ingested_count} (${ingestProgress}) · 失败 ${active.failed_count}`;
         const progress = Math.max(0, Math.min(Number(active.progress_percent || 0), 100));
         $("progressBar").style.width = `${progress}%`;
@@ -1252,8 +1263,8 @@ _ADMIN_HTML = """<!doctype html>
         const ingestStatus = ingestStatusLabel(active.current_ingest_status);
         const ingestStatusText = ingestStatus ? ` · ${ingestStatus}` : "";
         $("ingestDetail").textContent = ingestSymbol
-          ? `入库 ${ingestSymbol} · 当前归档 ${currentArchiveIngestProgress} · 总 ${ingestProgress}${ingestStatusText}${ingestPath}`
-          : `入库 当前归档 ${currentArchiveIngestProgress} · 总 ${ingestProgress}`;
+          ? `入库 ${ingestSymbol} · 当前归档 ${currentArchiveText} · 总 ${ingestProgress}${ingestStatusText}${ingestPath}`
+          : `入库 当前归档 ${currentArchiveText} · 总 ${ingestProgress}${ingestStatusText}${ingestPath}`;
       } else {
         activeJobId = null;
         $("activeStatus").className = "pill";

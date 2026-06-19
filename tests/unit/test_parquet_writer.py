@@ -52,6 +52,19 @@ def test_appends_another_day_for_same_symbol_month_and_keeps_canonical_columns(t
     assert list(df["close"]) == [1, 2]
 
 
+def test_new_partition_fast_path_does_not_read_existing_parquet(tmp_path, monkeypatch):
+    def fail_read_parquet(*args, **kwargs):
+        raise AssertionError("new partition should not read parquet")
+
+    monkeypatch.setattr(pd, "read_parquet", fail_read_parquet)
+
+    writer = ParquetBarWriter(tmp_path / "parquet")
+    [path] = writer.write_bars(_bars(close=1), Timeframe.M1)
+
+    assert path.exists()
+    assert not list(path.parent.glob("*.tmp"))
+
+
 def test_writes_daily_partition_with_quality_columns(tmp_path):
     writer = ParquetBarWriter(tmp_path / "parquet")
     daily = pd.DataFrame(

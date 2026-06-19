@@ -55,10 +55,34 @@ class ProcessLock:
     def _clear_stale_lock(self) -> bool:
         try:
             text = self.path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return self._clear_invalid_lock()
+        if not text:
+            return self._clear_invalid_lock()
+        try:
             pid = int(text)
-        except (FileNotFoundError, ValueError, OSError):
-            return False
+        except ValueError:
+            return self._clear_invalid_lock()
         if _process_exists(pid):
+            return False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _clear_invalid_lock(self) -> bool:
+        try:
+            age = time.time() - self.path.stat().st_mtime
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if age < max(self.timeout_seconds, 1.0):
             return False
         try:
             self.path.unlink()

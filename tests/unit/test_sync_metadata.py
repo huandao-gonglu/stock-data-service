@@ -78,6 +78,53 @@ def test_records_parse_failure_statuses_distinctly(metadata):
     ]
 
 
+def test_marks_file_ingest_statuses_in_batch(metadata):
+    metadata.commit_file_ingest(
+        source_id="s",
+        remote_path="/x.zip",
+        timeframe="1m",
+        symbol="sh600000",
+        start_ts=dt.datetime(2024, 12, 20, 9, 30),
+        end_ts=dt.datetime(2024, 12, 20, 9, 31),
+        row_count=1,
+        expected_row_count=240,
+        content_hash="a",
+        parquet_path="/p",
+    )
+
+    count = metadata.mark_file_ingest_status_many(
+        source_id="s",
+        remote_path="/x.zip",
+        timeframe="1m",
+        symbols=["sz000001", "sh600004", "sz000001"],
+        status="symbol_missing",
+        error_message="symbol not found in archive",
+        content_hash="a",
+    )
+
+    assert count == 2
+    assert metadata.fetchall("SELECT symbol, status, error_message FROM file_ingests ORDER BY symbol") == [
+        ("sh600000", "committed", None),
+        ("sh600004", "symbol_missing", "symbol not found in archive"),
+        ("sz000001", "symbol_missing", "symbol not found in archive"),
+    ]
+
+
+def test_archive_symbol_members_cache_is_content_hash_scoped(metadata):
+    metadata.upsert_archive_symbol_members(
+        source_id="s",
+        remote_path="/x.zip",
+        content_hash="hash-a",
+        members={"sh600000": "nested/sh600000.csv", "sz000001": "sz000001.csv"},
+    )
+
+    assert metadata.get_archive_symbol_members(source_id="s", remote_path="/x.zip", content_hash="hash-a") == {
+        "sh600000": "nested/sh600000.csv",
+        "sz000001": "sz000001.csv",
+    }
+    assert metadata.get_archive_symbol_members(source_id="s", remote_path="/x.zip", content_hash="hash-b") is None
+
+
 def test_upserts_symbol_listing_metadata(metadata):
     count = metadata.upsert_symbols(
         [
@@ -116,6 +163,55 @@ def test_coverage_and_sync_job_counters(metadata):
     metadata.complete_sync_job(job, scanned_count=2, downloaded_count=2, ingested_count=1, failed_count=1)
     assert metadata.fetchone("SELECT row_count, quality_flag FROM coverage_daily")[0:2] == (1, "partial")
     assert metadata.fetchone("SELECT scanned_count, ingested_count FROM sync_jobs WHERE id = ?", [job]) == (2, 1)
+
+
+def test_updates_coverage_daily_in_batch(metadata):
+    metadata.update_coverage_daily_many(
+        [
+            {
+                "symbol": "sh600000",
+                "timeframe": "1m",
+                "trade_date": dt.date(2024, 12, 20),
+                "start_ts": dt.datetime(2024, 12, 20, 9, 30),
+                "end_ts": dt.datetime(2024, 12, 20, 15, 0),
+                "row_count": 240,
+                "expected_row_count": 240,
+                "is_complete": True,
+                "quality_flag": "ok",
+            },
+            {
+                "symbol": "sz000001",
+                "timeframe": "1m",
+                "trade_date": dt.date(2024, 12, 20),
+                "start_ts": dt.datetime(2024, 12, 20, 9, 30),
+                "end_ts": dt.datetime(2024, 12, 20, 14, 0),
+                "row_count": 180,
+                "expected_row_count": 240,
+                "is_complete": False,
+                "quality_flag": "partial",
+            },
+        ]
+    )
+    metadata.update_coverage_daily_many(
+        [
+            {
+                "symbol": "sh600000",
+                "timeframe": "1m",
+                "trade_date": dt.date(2024, 12, 20),
+                "start_ts": dt.datetime(2024, 12, 20, 9, 30),
+                "end_ts": dt.datetime(2024, 12, 20, 11, 0),
+                "row_count": 90,
+                "expected_row_count": 240,
+                "is_complete": False,
+                "quality_flag": "partial",
+            }
+        ]
+    )
+
+    assert metadata.fetchall("SELECT symbol, row_count, quality_flag FROM coverage_daily ORDER BY symbol") == [
+        ("sh600000", 90, "partial"),
+        ("sz000001", 180, "partial"),
+    ]
 
 
 def test_marks_unfinished_sync_jobs_stopped(metadata):

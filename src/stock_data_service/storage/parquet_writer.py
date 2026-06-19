@@ -51,15 +51,17 @@ class ParquetBarWriter:
         for (symbol, year, month), group in df.groupby(["symbol", "year", "month"], sort=True):
             path = self.partition_path(timeframe=timeframe, symbol=symbol, year=int(year), month=int(month))
             with partition_lock(timeframe.value, symbol, int(year), int(month)):
+                write_mode = "merge" if path.exists() else "create"
                 merged = self._merge(path, group[INTRADAY_COLUMNS], subset=["symbol", "ts"], sort_col="ts")
                 self._atomic_write(path, merged[INTRADAY_COLUMNS])
                 logger.info(
-                    "parquet partition written timeframe=%s symbol=%s year=%s month=%s rows=%s path=%s",
+                    "parquet partition written timeframe=%s symbol=%s year=%s month=%s rows=%s mode=%s path=%s",
                     timeframe.value,
                     symbol,
                     int(year),
                     int(month),
                     len(merged),
+                    write_mode,
                     path,
                 )
             written.append(path)
@@ -79,15 +81,17 @@ class ParquetBarWriter:
         for (symbol, year, month), group in df.groupby(["symbol", "year", "month"], sort=True):
             path = self.partition_path(timeframe=Timeframe.D1, symbol=symbol, year=int(year), month=int(month))
             with partition_lock(Timeframe.D1.value, symbol, int(year), int(month)):
+                write_mode = "merge" if path.exists() else "create"
                 merged = self._merge(path, group[DAILY_COLUMNS], subset=["symbol", "trade_date"], sort_col="trade_date")
                 self._atomic_write(path, merged[DAILY_COLUMNS])
                 logger.info(
-                    "parquet partition written timeframe=%s symbol=%s year=%s month=%s rows=%s path=%s",
+                    "parquet partition written timeframe=%s symbol=%s year=%s month=%s rows=%s mode=%s path=%s",
                     Timeframe.D1.value,
                     symbol,
                     int(year),
                     int(month),
                     len(merged),
+                    write_mode,
                     path,
                 )
             written.append(path)

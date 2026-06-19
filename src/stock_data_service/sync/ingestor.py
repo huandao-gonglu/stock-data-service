@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import time
+import zipfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pandas as pd
 
@@ -21,6 +23,10 @@ logger = logging.getLogger(__name__)
 class IngestFileResult:
     status: str
     committed: bool = False
+    count: int = 1
+    archive_requested_count: int | None = None
+    archive_present_count: int | None = None
+    archive_missing_count: int | None = None
 
     @property
     def skipped(self) -> bool:
@@ -39,13 +45,16 @@ class IngestArchiveResult:
         return sum(self.status_counts.values())
 
     def add(self, outcome: IngestFileResult) -> None:
-        self.status_counts[outcome.status] = self.status_counts.get(outcome.status, 0) + 1
+        count = max(int(outcome.count), 0)
+        if count == 0:
+            return
+        self.status_counts[outcome.status] = self.status_counts.get(outcome.status, 0) + count
         if outcome.committed:
-            self.committed_count += 1
+            self.committed_count += count
         elif outcome.skipped:
-            self.skipped_count += 1
+            self.skipped_count += count
         else:
-            self.failed_count += 1
+            self.failed_count += count
 
 
 class Ingestor:
@@ -137,17 +146,98 @@ class Ingestor:
             len(normalized_symbols),
             raw_file.timeframe.value,
         )
+        index_started = time.perf_counter()
+        try:
+            member_index = self.metadata.get_archive_symbol_members(
+                source_id=source_id,
+                remote_path=raw_file.remote_path,
+                content_hash=raw_file.content_hash,
+            )
+            index_source = "cache"
+            if member_index is None:
+                index_source = "zip"
+                member_index = self.parser.symbol_member_index(raw_file.local_path)
+                self.metadata.upsert_archive_symbol_members(
+                    source_id=source_id,
+                    remote_path=raw_file.remote_path,
+                    content_hash=raw_file.content_hash,
+                    members=member_index,
+                )
+        except zipfile.BadZipFile as exc:
+            return self._mark_archive_status(
+                raw_file,
+                symbols=normalized_symbols,
+                source_id=source_id,
+                status="corrupted_zip",
+                error_message=str(exc),
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            return self._mark_archive_status(
+                raw_file,
+                symbols=normalized_symbols,
+                source_id=source_id,
+                status="parse_failed",
+                error_message=str(exc),
+                progress_callback=progress_callback,
+            )
+
+        present_symbols = [symbol for symbol in normalized_symbols if symbol in member_index]
+        missing_symbols = [symbol for symbol in normalized_symbols if symbol not in member_index]
+        logger.info(
+            "archive member index ready source_id=%s remote_path=%s source=%s requested=%s present=%s missing=%s seconds=%.3f",
+            source_id,
+            raw_file.remote_path,
+            index_source,
+            len(normalized_symbols),
+            len(present_symbols),
+            len(missing_symbols),
+            time.perf_counter() - index_started,
+        )
+
+        def with_archive_counts(outcome: IngestFileResult) -> IngestFileResult:
+            return replace(
+                outcome,
+                archive_requested_count=len(normalized_symbols),
+                archive_present_count=len(present_symbols),
+                archive_missing_count=len(missing_symbols),
+            )
+
+        if missing_symbols:
+            mark_started = time.perf_counter()
+            self.metadata.mark_file_ingest_status_many(
+                source_id=source_id,
+                remote_path=raw_file.remote_path,
+                timeframe=raw_file.timeframe.value,
+                symbols=missing_symbols,
+                status="symbol_missing",
+                error_message="symbol not found in archive",
+                content_hash=raw_file.content_hash,
+            )
+            outcome = with_archive_counts(IngestFileResult(status="symbol_missing", count=len(missing_symbols)))
+            archive_result.add(outcome)
+            logger.info(
+                "archive missing symbols marked source_id=%s remote_path=%s count=%s seconds=%.3f",
+                source_id,
+                raw_file.remote_path,
+                len(missing_symbols),
+                time.perf_counter() - mark_started,
+            )
+            if progress_callback is not None:
+                progress_callback("", outcome)
+
         for parsed_symbol, parse_result in self.parser.iter_parse_archive(
             raw_file.local_path,
-            normalized_symbols,
+            present_symbols,
             start=start,
             end=end,
             source_path=raw_file.remote_path,
+            member_index=member_index,
         ):
             if cancel_check is not None:
                 cancel_check()
             if progress_callback is not None:
-                progress_callback(parsed_symbol, IngestFileResult(status="ingesting"))
+                progress_callback(parsed_symbol, with_archive_counts(IngestFileResult(status="ingesting", count=0)))
             try:
                 self.metadata.start_file_ingest(
                     source_id=source_id,
@@ -163,6 +253,7 @@ class Ingestor:
                     result=parse_result,
                     log_details=False,
                 )
+                outcome = with_archive_counts(outcome)
             except Exception as exc:
                 logger.exception(
                     "archive ingest exception source_id=%s remote_path=%s symbol=%s",
@@ -179,7 +270,7 @@ class Ingestor:
                     error_message=str(exc),
                     content_hash=raw_file.content_hash,
                 )
-                outcome = IngestFileResult(status="failed")
+                outcome = with_archive_counts(IngestFileResult(status="failed"))
             archive_result.add(outcome)
             if progress_callback is not None:
                 progress_callback(parsed_symbol, outcome)
@@ -196,6 +287,46 @@ class Ingestor:
         )
         return archive_result
 
+    def _mark_archive_status(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbols: list[str],
+        source_id: str,
+        status: str,
+        error_message: str | None,
+        progress_callback: Callable[[str, IngestFileResult], None] | None,
+    ) -> IngestArchiveResult:
+        marked = self.metadata.mark_file_ingest_status_many(
+            source_id=source_id,
+            remote_path=raw_file.remote_path,
+            timeframe=raw_file.timeframe.value,
+            symbols=symbols,
+            status=status,
+            error_message=error_message,
+            content_hash=raw_file.content_hash,
+        )
+        outcome = IngestFileResult(
+            status=status,
+            count=marked,
+            archive_requested_count=len(symbols),
+            archive_present_count=0,
+            archive_missing_count=0,
+        )
+        archive_result = IngestArchiveResult()
+        archive_result.add(outcome)
+        if progress_callback is not None:
+            progress_callback("", outcome)
+        logger.warning(
+            "archive ingest marked all symbols source_id=%s remote_path=%s status=%s count=%s error=%s",
+            source_id,
+            raw_file.remote_path,
+            status,
+            marked,
+            error_message,
+        )
+        return archive_result
+
     def _record_parse_result(
         self,
         raw_file: LocalRawFile,
@@ -206,6 +337,7 @@ class Ingestor:
         log_details: bool,
     ) -> IngestFileResult:
         if result.status != "ok":
+            metadata_started = time.perf_counter()
             if log_details:
                 logger.warning(
                     "ingest parse status source_id=%s remote_path=%s symbol=%s status=%s error=%s",
@@ -224,10 +356,20 @@ class Ingestor:
                 error_message=result.error_message,
                 content_hash=raw_file.content_hash,
             )
+            logger.info(
+                "ingest symbol timing source_id=%s remote_path=%s symbol=%s status=%s parse_seconds=%s metadata_seconds=%.3f",
+                source_id,
+                raw_file.remote_path,
+                symbol,
+                result.status,
+                _seconds_text(result.parse_seconds),
+                time.perf_counter() - metadata_started,
+            )
             return IngestFileResult(status=result.status)
 
         df = result.dataframe
         if df.empty:
+            metadata_started = time.perf_counter()
             if log_details:
                 logger.info(
                     "ingest skipped empty rows source_id=%s remote_path=%s symbol=%s",
@@ -244,9 +386,20 @@ class Ingestor:
                 error_message="no rows in requested range",
                 content_hash=raw_file.content_hash,
             )
+            logger.info(
+                "ingest symbol timing source_id=%s remote_path=%s symbol=%s status=skipped parse_seconds=%s metadata_seconds=%.3f",
+                source_id,
+                raw_file.remote_path,
+                symbol,
+                _seconds_text(result.parse_seconds),
+                time.perf_counter() - metadata_started,
+            )
             return IngestFileResult(status="skipped")
 
+        write_started = time.perf_counter()
         written_paths = self.writer.write_bars(df, raw_file.timeframe)
+        write_seconds = time.perf_counter() - write_started
+        metadata_started = time.perf_counter()
         self._record_symbol(df)
         self._record_coverage(df, raw_file.timeframe)
         parquet_path = str(written_paths[0]) if written_paths else None
@@ -262,6 +415,7 @@ class Ingestor:
             content_hash=raw_file.content_hash,
             parquet_path=parquet_path,
         )
+        metadata_seconds = time.perf_counter() - metadata_started
         if log_details:
             logger.info(
                 "ingest committed source_id=%s remote_path=%s symbol=%s row_count=%s parquet_path=%s",
@@ -271,6 +425,17 @@ class Ingestor:
                 len(df),
                 parquet_path,
             )
+        logger.info(
+            "ingest symbol timing source_id=%s remote_path=%s symbol=%s status=committed rows=%s parse_seconds=%s write_seconds=%.3f metadata_seconds=%.3f parquet_paths=%s",
+            source_id,
+            raw_file.remote_path,
+            symbol,
+            len(df),
+            _seconds_text(result.parse_seconds),
+            write_seconds,
+            metadata_seconds,
+            len(written_paths),
+        )
         return IngestFileResult(status="committed", committed=True)
 
     def _record_symbol(self, df: pd.DataFrame) -> None:
@@ -284,20 +449,24 @@ class Ingestor:
         work = df.copy()
         work["ts"] = pd.to_datetime(work["ts"])
         work["trade_date"] = work["ts"].dt.date
+        rows: list[dict] = []
         for (symbol, trade_date), group in work.groupby(["symbol", "trade_date"], sort=True):
             row_count = int(len(group))
             complete = row_count >= expected
-            self.metadata.update_coverage_daily(
-                symbol=symbol,
-                timeframe=timeframe.value,
-                trade_date=trade_date,
-                start_ts=group["ts"].min().to_pydatetime(),
-                end_ts=(group["ts"].max() + pd.Timedelta(minutes=timeframe.minute_span or 1)).to_pydatetime(),
-                row_count=row_count,
-                expected_row_count=expected,
-                is_complete=complete,
-                quality_flag="ok" if complete else "partial",
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": timeframe.value,
+                    "trade_date": trade_date,
+                    "start_ts": group["ts"].min().to_pydatetime(),
+                    "end_ts": (group["ts"].max() + pd.Timedelta(minutes=timeframe.minute_span or 1)).to_pydatetime(),
+                    "row_count": row_count,
+                    "expected_row_count": expected,
+                    "is_complete": complete,
+                    "quality_flag": "ok" if complete else "partial",
+                }
             )
+        self.metadata.update_coverage_daily_many(rows)
 
 
 def _min_ts(df: pd.DataFrame) -> dt.datetime | None:
@@ -311,3 +480,9 @@ def _exclusive_end(df: pd.DataFrame, timeframe: Timeframe) -> dt.datetime | None
         return None
     minutes = timeframe.minute_span or 1
     return (pd.to_datetime(df["ts"]).max() + pd.Timedelta(minutes=minutes)).to_pydatetime()
+
+
+def _seconds_text(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.3f}"

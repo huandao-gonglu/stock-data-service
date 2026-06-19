@@ -101,6 +101,20 @@ def test_iter_parse_archive_builds_one_index_and_yields_symbol_results(tmp_path,
     assert list(results[1][1].dataframe["symbol"].unique()) == ["sz000001"]
 
 
+def test_symbol_member_index_selects_present_and_missing_symbols(tmp_path):
+    zip_path = tmp_path / "2000_1min.zip"
+    _write_multi_symbol_zip(zip_path)
+
+    parser = ZipBarParser()
+    index = parser.symbol_member_index(zip_path)
+    selection = parser.select_archive_symbols(zip_path, ["600000.SH", "000001.SZ", "sh600004"])
+
+    assert index["sh600000"] == "sh600000.csv"
+    assert index["sz000001"] == "sz000001.csv"
+    assert selection.present_symbols == ["sh600000", "sz000001"]
+    assert selection.missing_symbols == ["sh600004"]
+
+
 def test_iter_parse_archive_isolates_member_parse_failures(tmp_path):
     zip_path = tmp_path / "20241220_1min.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:

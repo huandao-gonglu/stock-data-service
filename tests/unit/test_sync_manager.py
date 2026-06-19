@@ -20,6 +20,9 @@ def test_managed_sync_job_to_dict_omits_cancel_event():
     assert payload["ingest_total_count"] is None
     assert payload["current_archive_ingest_processed_count"] == 0
     assert payload["current_archive_ingest_total_count"] is None
+    assert payload["current_archive_requested_count"] is None
+    assert payload["current_archive_present_count"] is None
+    assert payload["current_archive_missing_count"] == 0
     assert payload["current_ingest_symbol"] is None
     assert "cancel_event" not in payload
 
@@ -78,6 +81,75 @@ def test_download_progress_does_not_overwrite_ingest_stage(tmp_path):
     assert job.downloaded_bytes == 1024
 
 
+def test_progress_percent_does_not_regress_between_archives(tmp_path):
+    manager = SyncJobManager(Settings(data_root=tmp_path / "data"))
+    job = ManagedSyncJob(
+        id="job-1",
+        kind="baidu",
+        request=ManagedSyncRequest("baidu-main", "1m", "2000-01-01", "2026-06-19", ["sh600000"]),
+        status="running",
+        progress_percent=48,
+    )
+    manager._jobs[job.id] = job
+    manager._active_job_id = job.id
+
+    manager._update_progress(
+        job.id,
+        "scan next archive",
+        35,
+        counts={
+            "scanned_count": 10,
+            "downloaded_count": 9,
+            "ingested_count": 39,
+            "failed_count": 0,
+            "planned_download_count": 135,
+            "ingest_processed_count": 50,
+            "ingest_total_count": 675,
+            "current_archive_ingest_processed_count": 0,
+            "current_archive_ingest_total_count": 5,
+        },
+    )
+
+    assert job.progress_percent == 48
+    assert job.stage == "scan next archive"
+    assert job.scanned_count == 10
+    assert job.current_archive_ingest_processed_count == 0
+
+
+def test_counts_progress_can_clear_stale_ingest_details(tmp_path):
+    manager = SyncJobManager(Settings(data_root=tmp_path / "data"))
+    job = ManagedSyncJob(
+        id="job-1",
+        kind="baidu",
+        request=ManagedSyncRequest("baidu-main", "1m", "2000-01-01", "2026-06-19", ["sh600000"]),
+        status="running",
+        current_ingest_symbol="sh600000",
+        current_ingest_path="/A股_分时数据/1分钟_按年汇总/2000_1min.zip",
+        current_ingest_status="committed",
+    )
+    manager._jobs[job.id] = job
+    manager._active_job_id = job.id
+
+    manager._update_progress(
+        job.id,
+        "scan next archive",
+        45,
+        counts={
+            "scanned_count": 2,
+            "downloaded_count": 1,
+            "ingested_count": 1,
+            "failed_count": 0,
+            "current_ingest_symbol": None,
+            "current_ingest_path": None,
+            "current_ingest_status": None,
+        },
+    )
+
+    assert job.current_ingest_symbol is None
+    assert job.current_ingest_path is None
+    assert job.current_ingest_status is None
+
+
 def test_sync_manager_records_ingest_progress_details(tmp_path):
     manager = SyncJobManager(Settings(data_root=tmp_path / "data"))
     job = ManagedSyncJob(
@@ -103,6 +175,9 @@ def test_sync_manager_records_ingest_progress_details(tmp_path):
             "ingest_total_count": 2,
             "current_archive_ingest_processed_count": 1,
             "current_archive_ingest_total_count": 2,
+            "current_archive_requested_count": 5,
+            "current_archive_present_count": 2,
+            "current_archive_missing_count": 3,
             "current_ingest_symbol": "sh600000",
             "current_ingest_path": "/A股_分时数据/1分钟_按年汇总/2024_1min.zip",
             "current_ingest_status": "committed",
@@ -117,6 +192,9 @@ def test_sync_manager_records_ingest_progress_details(tmp_path):
     assert payload["ingest_total_count"] == 2
     assert payload["current_archive_ingest_processed_count"] == 1
     assert payload["current_archive_ingest_total_count"] == 2
+    assert payload["current_archive_requested_count"] == 5
+    assert payload["current_archive_present_count"] == 2
+    assert payload["current_archive_missing_count"] == 3
     assert payload["current_ingest_symbol"] == "sh600000"
     assert payload["current_ingest_path"] == "/A股_分时数据/1分钟_按年汇总/2024_1min.zip"
     assert payload["current_ingest_status"] == "committed"
