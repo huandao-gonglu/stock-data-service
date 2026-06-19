@@ -26,6 +26,8 @@ INTRADAY_COLUMNS = [
     "quality_flag",
 ]
 
+INTRADAY_TEXT_COLUMNS = ["symbol", "code", "name", "source", "source_path", "quality_flag"]
+
 DAILY_COLUMNS = [
     "symbol",
     "trade_date",
@@ -44,6 +46,8 @@ DAILY_COLUMNS = [
     "quality_flag",
 ]
 
+DAILY_TEXT_COLUMNS = ["symbol", "source", "source_path", "quality_flag"]
+
 
 def canonical_intraday(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
@@ -51,7 +55,21 @@ def canonical_intraday(df: pd.DataFrame) -> pd.DataFrame:
         if col not in result.columns:
             result[col] = None
     result = result[INTRADAY_COLUMNS]
+    for col in INTRADAY_TEXT_COLUMNS:
+        result[col] = _text_or_null(result[col])
     result["ts"] = pd.to_datetime(result["ts"])
+    return result
+
+
+def canonical_daily(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    for col in DAILY_COLUMNS:
+        if col not in result.columns:
+            result[col] = None
+    result = result[DAILY_COLUMNS]
+    for col in DAILY_TEXT_COLUMNS:
+        result[col] = _text_or_null(result[col])
+    result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.date
     return result
 
 
@@ -91,3 +109,7 @@ def synthesize_daily_from_intraday(
             }
         )
     return pd.DataFrame(rows, columns=DAILY_COLUMNS)
+
+
+def _text_or_null(series: pd.Series) -> pd.Series:
+    return series.map(lambda value: None if pd.isna(value) else str(value))

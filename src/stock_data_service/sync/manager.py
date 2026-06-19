@@ -106,8 +106,15 @@ class ManagedSyncJob:
     current_ingest_symbol: str | None = None
     current_ingest_path: str | None = None
     current_ingest_status: str | None = None
+    eta_seconds: int | None = None
+    eta_confidence: str = "warming_up"
+    progress_rate_percent_per_min: float | None = None
     error_message: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    _eta_last_at: dt.datetime | None = field(default=None, repr=False)
+    _eta_last_progress: float | None = field(default=None, repr=False)
+    _eta_rate_percent_per_sec: float | None = field(default=None, repr=False)
+    _eta_sample_count: int = field(default=0, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -139,6 +146,9 @@ class ManagedSyncJob:
             "current_ingest_symbol": self.current_ingest_symbol,
             "current_ingest_path": self.current_ingest_path,
             "current_ingest_status": self.current_ingest_status,
+            "eta_seconds": self.eta_seconds,
+            "eta_confidence": self.eta_confidence,
+            "progress_rate_percent_per_min": self.progress_rate_percent_per_min,
             "error_message": self.error_message,
         }
 
@@ -184,6 +194,7 @@ class SyncJobManager:
                 return job
             job.status = "stopping"
             job.stage = "正在停止"
+            self._clear_eta(job)
             job.cancel_event.set()
             return job
 
@@ -203,6 +214,7 @@ class SyncJobManager:
             job.started_at = _now()
             job.stage = "开始同步"
             job.progress_percent = 5
+            self._prime_eta(job)
         logger.info("managed baidu sync started job_id=%s request=%s", job.id, _request_log_summary(job.request))
 
         try:
@@ -248,7 +260,7 @@ class SyncJobManager:
                 job.stage = "同步完成"
                 job.progress_percent = 100
                 self._clear_download(job)
-                self._clear_ingest(job)
+                self._finish_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu sync finished job_id=%s status=%s", job.id, job.status)
 
@@ -262,6 +274,7 @@ class SyncJobManager:
             job.started_at = _now()
             job.stage = "开始同步文件"
             job.progress_percent = 5
+            self._prime_eta(job)
         logger.info("managed baidu file sync started job_id=%s request=%s", job.id, _request_log_summary(request))
 
         try:
@@ -308,7 +321,7 @@ class SyncJobManager:
                 job.stage = "同步完成"
                 job.progress_percent = 100
                 self._clear_download(job)
-                self._clear_ingest(job)
+                self._finish_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu file sync finished job_id=%s status=%s", job.id, job.status)
 
@@ -373,6 +386,7 @@ class SyncJobManager:
                 job.current_download_path = download.get("remote_path")
             else:
                 self._clear_download(job)
+            self._update_eta(job)
 
     @staticmethod
     def _clear_download(job: ManagedSyncJob) -> None:
@@ -386,6 +400,95 @@ class SyncJobManager:
         job.current_ingest_symbol = None
         job.current_ingest_path = None
         job.current_ingest_status = None
+        SyncJobManager._clear_eta(job)
+
+    @staticmethod
+    def _clear_eta(job: ManagedSyncJob) -> None:
+        job.eta_seconds = None
+        job.eta_confidence = "none"
+        job.progress_rate_percent_per_min = None
+        job._eta_last_at = None
+        job._eta_last_progress = None
+        job._eta_rate_percent_per_sec = None
+        job._eta_sample_count = 0
+
+    @staticmethod
+    def _prime_eta(job: ManagedSyncJob) -> None:
+        job.eta_seconds = None
+        job.eta_confidence = "warming_up"
+        job.progress_rate_percent_per_min = None
+        job._eta_last_at = _now()
+        job._eta_last_progress = SyncJobManager._eta_progress_value(job)
+        job._eta_rate_percent_per_sec = None
+        job._eta_sample_count = 0
+
+    @staticmethod
+    def _update_eta(job: ManagedSyncJob) -> None:
+        if job.status not in {"queued", "running"}:
+            SyncJobManager._clear_eta(job)
+            return
+
+        now = _now()
+        progress = SyncJobManager._eta_progress_value(job)
+        if job._eta_last_at is None or job._eta_last_progress is None:
+            job._eta_last_at = now
+            job._eta_last_progress = progress
+            job.eta_seconds = None
+            job.eta_confidence = "warming_up"
+            return
+
+        elapsed = (now - job._eta_last_at).total_seconds()
+        advanced = progress - job._eta_last_progress
+        if elapsed < 1 or advanced <= 0:
+            return
+
+        instant_rate = advanced / elapsed
+        previous_rate = job._eta_rate_percent_per_sec
+        if previous_rate is None:
+            rate = instant_rate
+        else:
+            rate = previous_rate * 0.65 + instant_rate * 0.35
+        if rate <= 0:
+            return
+
+        job._eta_rate_percent_per_sec = rate
+        job._eta_sample_count += 1
+        remaining = max(100.0 - progress, 0.0)
+        job.eta_seconds = 0 if remaining == 0 else max(1, int(round(remaining / rate)))
+        job.progress_rate_percent_per_min = round(rate * 60.0, 2)
+        if previous_rate is None or job._eta_sample_count < 2:
+            job.eta_confidence = "warming_up"
+        else:
+            ratio = instant_rate / previous_rate if previous_rate > 0 else 1.0
+            job.eta_confidence = "volatile" if ratio < 0.4 or ratio > 2.5 else "stable"
+        job._eta_last_at = now
+        job._eta_last_progress = progress
+
+    @staticmethod
+    def _eta_progress_value(job: ManagedSyncJob) -> float:
+        progress = float(max(0, min(job.progress_percent, 100)))
+        if job.ingest_total_count and job.ingest_total_count > 0 and (
+            progress >= 45 or job.downloaded_count > 0 or job.ingest_processed_count > 0
+        ):
+            ingest_ratio = min(max(job.ingest_processed_count, 0) / max(job.ingest_total_count, 1), 1.0)
+            progress = max(progress, 45.0 + ingest_ratio * 53.0)
+        elif job.planned_download_count and job.planned_download_count > 0:
+            scan_ratio = min(max(job.scanned_count, 0) / max(job.planned_download_count, 1), 1.0)
+            progress = max(progress, 10.0 + scan_ratio * 35.0)
+        return max(0.0, min(progress, 100.0))
+
+    @staticmethod
+    def _finish_ingest(job: ManagedSyncJob) -> None:
+        if job.ingest_total_count is not None:
+            job.ingest_processed_count = job.ingest_total_count
+        elif job.ingest_processed_count:
+            job.ingest_total_count = job.ingest_processed_count
+        job.current_archive_ingest_processed_count = 0
+        job.current_archive_ingest_total_count = None
+        job.current_archive_requested_count = None
+        job.current_archive_present_count = None
+        job.current_archive_missing_count = 0
+        SyncJobManager._clear_ingest(job)
 
     def _build_baidu_runner(self, request: ManagedSyncRequest | ManagedFileSyncRequest) -> BaiduSyncJobRunner:
         token_manager = TokenManager(

@@ -84,6 +84,59 @@ def test_local_sync_job_ingests_multiple_symbols_from_one_archive(tmp_path):
     ]
 
 
+def test_local_sync_parallel_archive_ingest_is_idempotent(tmp_path):
+    raw = tmp_path / "raw/A股_分时数据/1分钟"
+    raw.mkdir(parents=True)
+    (raw / "20241220_1min.zip").write_bytes(_zip_with_symbols(close=1))
+    metadata = SyncMetadata(tmp_path / "meta.duckdb")
+    runner = LocalSyncJobRunner(raw_root=tmp_path / "raw", parquet_root=tmp_path / "parquet", metadata=metadata)
+
+    for _ in range(2):
+        result = runner.run(
+            timeframe=Timeframe.M1,
+            start=dt.date(2024, 12, 20),
+            end=dt.date(2024, 12, 20),
+            symbols=["sh600000", "sz000001"],
+        )
+        assert result.ingested_count == 2
+        assert result.failed_count == 0
+
+    repo = DuckDBRepository(tmp_path / "parquet", metadata.db_path)
+    for symbol in ["sh600000", "sz000001"]:
+        df = repo.query_bars(
+            symbol=symbol,
+            timeframe=Timeframe.M1,
+            start=dt.datetime(2024, 12, 20, 9, 30),
+            end=dt.datetime(2024, 12, 20, 9, 31),
+        )
+        assert len(df) == 1
+    assert metadata.fetchall("SELECT symbol, status FROM file_ingests ORDER BY symbol") == [
+        ("sh600000", "committed"),
+        ("sz000001", "committed"),
+    ]
+
+
+def test_local_sync_parallel_archive_keeps_success_when_one_symbol_fails(tmp_path):
+    raw = tmp_path / "raw/A股_分时数据/1分钟"
+    raw.mkdir(parents=True)
+    (raw / "20241220_1min.zip").write_bytes(_zip_with_bad_symbol())
+    metadata = SyncMetadata(tmp_path / "meta.duckdb")
+
+    result = LocalSyncJobRunner(raw_root=tmp_path / "raw", parquet_root=tmp_path / "parquet", metadata=metadata).run(
+        timeframe=Timeframe.M1,
+        start=dt.date(2024, 12, 20),
+        end=dt.date(2024, 12, 20),
+        symbols=["sh600000", "sz000001"],
+    )
+
+    assert result.ingested_count == 1
+    assert result.failed_count == 1
+    assert metadata.fetchall("SELECT symbol, status FROM file_ingests ORDER BY symbol") == [
+        ("sh600000", "committed"),
+        ("sz000001", "parse_failed"),
+    ]
+
+
 def test_local_sync_missing_symbol_in_one_archive_does_not_skip_later_archive(tmp_path):
     raw = tmp_path / "raw/A股K线分时数据/1分钟"
     raw.mkdir(parents=True)
@@ -133,4 +186,18 @@ def _zip_with_symbols(close: float) -> bytes:
             rows = sample_rows(symbol=symbol, name=name)
             rows[0]["收盘价"] = close
             archive.writestr(f"{symbol}.csv", pd.DataFrame(rows[:1]).to_csv(index=False).encode("utf-8-sig"))
+    return buffer.getvalue()
+
+
+def _zip_with_bad_symbol() -> bytes:
+    import io
+    import pandas as pd
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "sh600000.csv",
+            pd.DataFrame(sample_rows(symbol="sh600000")).to_csv(index=False).encode("utf-8-sig"),
+        )
+        archive.writestr("sz000001.csv", "not,a,valid\n1,2")
     return buffer.getvalue()

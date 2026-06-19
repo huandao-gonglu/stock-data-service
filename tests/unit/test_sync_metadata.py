@@ -214,6 +214,74 @@ def test_updates_coverage_daily_in_batch(metadata):
     ]
 
 
+def test_records_ingest_metadata_in_one_batch(metadata):
+    metadata.record_ingest_metadata_many(
+        symbol_records=[
+            {
+                "symbol": "sh600000",
+                "code": "600000",
+                "name": "浦发银行",
+                "exchange": "sh",
+                "source": "ingest",
+            }
+        ],
+        coverage_rows=[
+            {
+                "symbol": "sh600000",
+                "timeframe": "1m",
+                "trade_date": dt.date(2024, 12, 20),
+                "start_ts": dt.datetime(2024, 12, 20, 9, 30),
+                "end_ts": dt.datetime(2024, 12, 20, 9, 32),
+                "row_count": 2,
+                "expected_row_count": 240,
+                "is_complete": False,
+                "quality_flag": "partial",
+            }
+        ],
+        file_ingest_rows=[
+            {
+                "source_id": "s",
+                "remote_path": "/x.zip",
+                "timeframe": "1m",
+                "symbol": "sh600000",
+                "start_ts": dt.datetime(2024, 12, 20, 9, 30),
+                "end_ts": dt.datetime(2024, 12, 20, 9, 32),
+                "row_count": 2,
+                "expected_row_count": 240,
+                "content_hash": "hash",
+                "parquet_path": "/p",
+                "status": "committed",
+                "error_message": None,
+            },
+            {
+                "source_id": "s",
+                "remote_path": "/x.zip",
+                "timeframe": "1m",
+                "symbol": "sz000001",
+                "row_count": 0,
+                "content_hash": "hash",
+                "status": "parse_failed",
+                "error_message": "bad csv",
+            },
+        ],
+    )
+
+    assert metadata.fetchone("SELECT symbol, code, name, source FROM symbols WHERE symbol='sh600000'") == (
+        "sh600000",
+        "600000",
+        "浦发银行",
+        "ingest",
+    )
+    assert metadata.fetchone("SELECT row_count, quality_flag FROM coverage_daily WHERE symbol='sh600000'") == (
+        2,
+        "partial",
+    )
+    assert metadata.fetchall("SELECT symbol, status, row_count, error_message FROM file_ingests ORDER BY symbol") == [
+        ("sh600000", "committed", 2, None),
+        ("sz000001", "parse_failed", 0, "bad csv"),
+    ]
+
+
 def test_marks_unfinished_sync_jobs_stopped(metadata):
     running_job = metadata.create_sync_job("s")
     completed_job = metadata.create_sync_job("s")

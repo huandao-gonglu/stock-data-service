@@ -459,6 +459,134 @@ class SyncMetadata:
             )
         return len(rows)
 
+    def record_ingest_metadata_many(
+        self,
+        *,
+        symbol_records: list[dict[str, Any]] | None = None,
+        coverage_rows: list[dict[str, Any]] | None = None,
+        file_ingest_rows: list[dict[str, Any]] | None = None,
+    ) -> None:
+        symbol_records = symbol_records or []
+        coverage_rows = coverage_rows or []
+        file_ingest_rows = file_ingest_rows or []
+        if not symbol_records and not coverage_rows and not file_ingest_rows:
+            return
+
+        now = _now()
+        with self.connect() as con:
+            con.execute("BEGIN TRANSACTION")
+            try:
+                if symbol_records:
+                    symbols_frame = _frame_with_columns(
+                        symbol_records,
+                        ["symbol", "code", "name", "exchange", "listed_at", "delisted_at", "status", "source"],
+                    )
+                    symbols_frame = symbols_frame.drop_duplicates(subset=["symbol"], keep="last")
+                    symbols_frame["updated_at"] = now
+                    con.register("bulk_ingest_symbols", symbols_frame)
+                    con.execute(
+                        """
+                        DELETE FROM symbols
+                        USING bulk_ingest_symbols
+                        WHERE symbols.symbol = bulk_ingest_symbols.symbol
+                        """
+                    )
+                    con.execute(
+                        """
+                        INSERT INTO symbols
+                        (symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at)
+                        SELECT symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at
+                        FROM bulk_ingest_symbols
+                        """
+                    )
+
+                if coverage_rows:
+                    coverage_frame = _frame_with_columns(
+                        coverage_rows,
+                        [
+                            "symbol",
+                            "timeframe",
+                            "trade_date",
+                            "start_ts",
+                            "end_ts",
+                            "row_count",
+                            "expected_row_count",
+                            "is_complete",
+                            "quality_flag",
+                        ],
+                    )
+                    coverage_frame["updated_at"] = now
+                    con.register("bulk_ingest_coverage_daily", coverage_frame)
+                    con.execute(
+                        """
+                        DELETE FROM coverage_daily
+                        USING bulk_ingest_coverage_daily
+                        WHERE coverage_daily.symbol = bulk_ingest_coverage_daily.symbol
+                          AND coverage_daily.timeframe = bulk_ingest_coverage_daily.timeframe
+                          AND coverage_daily.trade_date = bulk_ingest_coverage_daily.trade_date
+                        """
+                    )
+                    con.execute(
+                        """
+                        INSERT INTO coverage_daily
+                        (symbol, timeframe, trade_date, start_ts, end_ts, row_count,
+                         expected_row_count, is_complete, quality_flag, updated_at)
+                        SELECT symbol, timeframe, trade_date, start_ts, end_ts, row_count,
+                               expected_row_count, is_complete, quality_flag, updated_at
+                        FROM bulk_ingest_coverage_daily
+                        """
+                    )
+
+                if file_ingest_rows:
+                    ingest_frame = _frame_with_columns(
+                        file_ingest_rows,
+                        [
+                            "source_id",
+                            "remote_path",
+                            "timeframe",
+                            "symbol",
+                            "start_ts",
+                            "end_ts",
+                            "row_count",
+                            "expected_row_count",
+                            "content_hash",
+                            "parquet_path",
+                            "status",
+                            "error_message",
+                        ],
+                    )
+                    ingest_frame["ingested_at"] = now
+                    ingest_frame["committed_at"] = ingest_frame["status"].map(
+                        lambda status: now if status == "committed" else None
+                    )
+                    con.register("bulk_ingest_file_ingests", ingest_frame)
+                    con.execute(
+                        """
+                        DELETE FROM file_ingests
+                        USING bulk_ingest_file_ingests
+                        WHERE file_ingests.source_id = bulk_ingest_file_ingests.source_id
+                          AND file_ingests.remote_path = bulk_ingest_file_ingests.remote_path
+                          AND file_ingests.timeframe = bulk_ingest_file_ingests.timeframe
+                          AND file_ingests.symbol = bulk_ingest_file_ingests.symbol
+                        """
+                    )
+                    con.execute(
+                        """
+                        INSERT INTO file_ingests
+                        (source_id, remote_path, timeframe, symbol, start_ts, end_ts, row_count,
+                         expected_row_count, content_hash, parquet_path, status, ingested_at,
+                         committed_at, error_message)
+                        SELECT source_id, remote_path, timeframe, symbol, start_ts, end_ts, row_count,
+                               expected_row_count, content_hash, parquet_path, status, ingested_at,
+                               committed_at, error_message
+                        FROM bulk_ingest_file_ingests
+                        """
+                    )
+                con.execute("COMMIT")
+            except Exception:
+                con.execute("ROLLBACK")
+                raise
+
     def dates_requiring_sync(
         self,
         *,
@@ -659,6 +787,14 @@ class SyncMetadata:
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _frame_with_columns(rows: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = None
+    return frame[columns]
 
 
 def _db_lock(path: Path) -> threading.RLock:

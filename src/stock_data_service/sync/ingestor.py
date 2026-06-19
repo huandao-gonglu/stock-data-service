@@ -4,8 +4,10 @@ import datetime as dt
 import logging
 import time
 import zipfile
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
+from typing import Any
 
 import pandas as pd
 
@@ -24,6 +26,7 @@ class IngestFileResult:
     status: str
     committed: bool = False
     count: int = 1
+    error_message: str | None = None
     archive_requested_count: int | None = None
     archive_present_count: int | None = None
     archive_missing_count: int | None = None
@@ -57,6 +60,18 @@ class IngestArchiveResult:
             self.failed_count += count
 
 
+@dataclass(frozen=True)
+class IngestSymbolTaskResult:
+    symbol: str
+    outcome: IngestFileResult
+    file_ingest_row: dict[str, Any] | None = None
+    symbol_records: tuple[dict[str, Any], ...] = ()
+    coverage_rows: tuple[dict[str, Any], ...] = ()
+    parse_seconds: float | None = None
+    write_seconds: float = 0.0
+    written_paths: tuple[str, ...] = ()
+
+
 class Ingestor:
     def __init__(
         self,
@@ -64,10 +79,12 @@ class Ingestor:
         writer: ParquetBarWriter,
         metadata: SyncMetadata,
         parser: ZipBarParser | None = None,
+        archive_workers: int = 2,
     ):
         self.writer = writer
         self.metadata = metadata
         self.parser = parser or ZipBarParser()
+        self.archive_workers = max(int(archive_workers), 1)
 
     def ingest_file(
         self,
@@ -137,7 +154,7 @@ class Ingestor:
         cancel_check: Callable[[], None] | None = None,
         progress_callback: Callable[[str, IngestFileResult], None] | None = None,
     ) -> IngestArchiveResult:
-        normalized_symbols = [normalize_symbol(symbol) for symbol in symbols]
+        normalized_symbols = list(dict.fromkeys(normalize_symbol(symbol) for symbol in symbols))
         archive_result = IngestArchiveResult()
         logger.info(
             "archive ingest started source_id=%s remote_path=%s symbol_count=%s timeframe=%s",
@@ -226,54 +243,21 @@ class Ingestor:
             if progress_callback is not None:
                 progress_callback("", outcome)
 
-        for parsed_symbol, parse_result in self.parser.iter_parse_archive(
-            raw_file.local_path,
-            present_symbols,
+        for task_result in self._ingest_present_symbols(
+            raw_file,
+            symbols=present_symbols,
+            source_id=source_id,
             start=start,
             end=end,
-            source_path=raw_file.remote_path,
             member_index=member_index,
+            cancel_check=cancel_check,
+            progress_callback=(
+                (lambda symbol, outcome: progress_callback(symbol, with_archive_counts(outcome)))
+                if progress_callback is not None
+                else None
+            ),
         ):
-            if cancel_check is not None:
-                cancel_check()
-            if progress_callback is not None:
-                progress_callback(parsed_symbol, with_archive_counts(IngestFileResult(status="ingesting", count=0)))
-            try:
-                self.metadata.start_file_ingest(
-                    source_id=source_id,
-                    remote_path=raw_file.remote_path,
-                    timeframe=raw_file.timeframe.value,
-                    symbol=parsed_symbol,
-                    content_hash=raw_file.content_hash,
-                )
-                outcome = self._record_parse_result(
-                    raw_file,
-                    symbol=parsed_symbol,
-                    source_id=source_id,
-                    result=parse_result,
-                    log_details=False,
-                )
-                outcome = with_archive_counts(outcome)
-            except Exception as exc:
-                logger.exception(
-                    "archive ingest exception source_id=%s remote_path=%s symbol=%s",
-                    source_id,
-                    raw_file.remote_path,
-                    parsed_symbol,
-                )
-                self.metadata.mark_file_ingest_status(
-                    source_id=source_id,
-                    remote_path=raw_file.remote_path,
-                    timeframe=raw_file.timeframe.value,
-                    symbol=parsed_symbol,
-                    status="failed",
-                    error_message=str(exc),
-                    content_hash=raw_file.content_hash,
-                )
-                outcome = with_archive_counts(IngestFileResult(status="failed"))
-            archive_result.add(outcome)
-            if progress_callback is not None:
-                progress_callback(parsed_symbol, outcome)
+            archive_result.add(with_archive_counts(task_result.outcome))
 
         logger.info(
             "archive ingest finished source_id=%s remote_path=%s processed=%s committed=%s skipped=%s failed=%s statuses=%s",
@@ -286,6 +270,335 @@ class Ingestor:
             archive_result.status_counts,
         )
         return archive_result
+
+    def _ingest_present_symbols(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbols: list[str],
+        source_id: str,
+        start: dt.datetime | None,
+        end: dt.datetime | None,
+        member_index: dict[str, str],
+        cancel_check: Callable[[], None] | None,
+        progress_callback: Callable[[str, IngestFileResult], None] | None,
+    ) -> list[IngestSymbolTaskResult]:
+        if not symbols:
+            return []
+
+        worker_count = min(self.archive_workers, len(symbols))
+        started = time.perf_counter()
+        if worker_count <= 1:
+            task_results = self._ingest_present_symbols_sequential(
+                raw_file,
+                symbols=symbols,
+                source_id=source_id,
+                start=start,
+                end=end,
+                member_index=member_index,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+        else:
+            task_results = self._ingest_present_symbols_parallel(
+                raw_file,
+                symbols=symbols,
+                source_id=source_id,
+                start=start,
+                end=end,
+                member_index=member_index,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+                worker_count=worker_count,
+            )
+
+        if cancel_check is not None:
+            cancel_check()
+        metadata_started = time.perf_counter()
+        self._record_task_metadata(task_results)
+        metadata_seconds = time.perf_counter() - metadata_started
+        for task_result in task_results:
+            self._log_task_timing(raw_file, source_id, task_result, metadata_seconds)
+        logger.info(
+            "archive present symbols ingested source_id=%s remote_path=%s present=%s workers=%s seconds=%.3f metadata_seconds=%.3f",
+            source_id,
+            raw_file.remote_path,
+            len(symbols),
+            worker_count,
+            time.perf_counter() - started,
+            metadata_seconds,
+        )
+        return task_results
+
+    def _ingest_present_symbols_sequential(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbols: list[str],
+        source_id: str,
+        start: dt.datetime | None,
+        end: dt.datetime | None,
+        member_index: dict[str, str],
+        cancel_check: Callable[[], None] | None,
+        progress_callback: Callable[[str, IngestFileResult], None] | None,
+    ) -> list[IngestSymbolTaskResult]:
+        task_results: list[IngestSymbolTaskResult] = []
+        for parsed_symbol, parse_result in self.parser.iter_parse_archive(
+            raw_file.local_path,
+            symbols,
+            start=start,
+            end=end,
+            source_path=raw_file.remote_path,
+            member_index=member_index,
+        ):
+            if cancel_check is not None:
+                cancel_check()
+            if progress_callback is not None:
+                progress_callback(parsed_symbol, IngestFileResult(status="ingesting", count=0))
+            try:
+                task_result = self._task_result_from_parse_result(
+                    raw_file,
+                    symbol=parsed_symbol,
+                    source_id=source_id,
+                    result=parse_result,
+                    writer=ParquetBarWriter(self.writer.parquet_root),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "archive ingest exception source_id=%s remote_path=%s symbol=%s",
+                    source_id,
+                    raw_file.remote_path,
+                    parsed_symbol,
+                )
+                task_result = self._failed_task_result(raw_file, source_id=source_id, symbol=parsed_symbol, error=exc)
+            task_results.append(task_result)
+            if progress_callback is not None:
+                progress_callback(parsed_symbol, task_result.outcome)
+        return task_results
+
+    def _ingest_present_symbols_parallel(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbols: list[str],
+        source_id: str,
+        start: dt.datetime | None,
+        end: dt.datetime | None,
+        member_index: dict[str, str],
+        cancel_check: Callable[[], None] | None,
+        progress_callback: Callable[[str, IngestFileResult], None] | None,
+        worker_count: int,
+    ) -> list[IngestSymbolTaskResult]:
+        task_results: list[IngestSymbolTaskResult] = []
+        symbol_iter = iter(symbols)
+        futures: dict[Future[IngestSymbolTaskResult], str] = {}
+        in_progress: set[str] = set()
+
+        def submit_next(executor: ThreadPoolExecutor) -> bool:
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                symbol = next(symbol_iter)
+            except StopIteration:
+                return False
+            if symbol in in_progress:
+                raise RuntimeError(f"duplicate in-flight archive symbol: {symbol}")
+            in_progress.add(symbol)
+            if progress_callback is not None:
+                progress_callback(symbol, IngestFileResult(status="ingesting", count=0))
+            future = executor.submit(
+                self._ingest_archive_symbol_task,
+                raw_file,
+                symbol=symbol,
+                source_id=source_id,
+                start=start,
+                end=end,
+                member_name=member_index.get(symbol),
+            )
+            futures[future] = symbol
+            return True
+
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="archive-symbol") as executor:
+            for _ in range(worker_count):
+                if not submit_next(executor):
+                    break
+            while futures:
+                if cancel_check is not None:
+                    cancel_check()
+                done, _ = wait(futures.keys(), timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    symbol = futures.pop(future)
+                    in_progress.remove(symbol)
+                    try:
+                        task_result = future.result()
+                    except Exception as exc:
+                        logger.exception(
+                            "archive ingest worker exception source_id=%s remote_path=%s symbol=%s",
+                            source_id,
+                            raw_file.remote_path,
+                            symbol,
+                        )
+                        task_result = self._failed_task_result(raw_file, source_id=source_id, symbol=symbol, error=exc)
+                    task_results.append(task_result)
+                    if progress_callback is not None:
+                        progress_callback(symbol, task_result.outcome)
+                    submit_next(executor)
+        return task_results
+
+    def _ingest_archive_symbol_task(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbol: str,
+        source_id: str,
+        start: dt.datetime | None,
+        end: dt.datetime | None,
+        member_name: str | None,
+    ) -> IngestSymbolTaskResult:
+        result = self.parser.parse_member(
+            raw_file.local_path,
+            symbol,
+            member_name,
+            start=start,
+            end=end,
+            source_path=raw_file.remote_path,
+        )
+        return self._task_result_from_parse_result(
+            raw_file,
+            symbol=symbol,
+            source_id=source_id,
+            result=result,
+            writer=ParquetBarWriter(self.writer.parquet_root),
+        )
+
+    def _task_result_from_parse_result(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        symbol: str,
+        source_id: str,
+        result: ParseResult,
+        writer: ParquetBarWriter,
+    ) -> IngestSymbolTaskResult:
+        if result.status != "ok":
+            outcome = IngestFileResult(status=result.status, error_message=result.error_message)
+            return IngestSymbolTaskResult(
+                symbol=symbol,
+                outcome=outcome,
+                file_ingest_row=_file_ingest_status_row(
+                    raw_file,
+                    source_id=source_id,
+                    symbol=symbol,
+                    status=result.status,
+                    error_message=result.error_message,
+                ),
+                parse_seconds=result.parse_seconds,
+            )
+
+        df = result.dataframe
+        if df.empty:
+            error_message = "no rows in requested range"
+            outcome = IngestFileResult(status="skipped", error_message=error_message)
+            return IngestSymbolTaskResult(
+                symbol=symbol,
+                outcome=outcome,
+                file_ingest_row=_file_ingest_status_row(
+                    raw_file,
+                    source_id=source_id,
+                    symbol=symbol,
+                    status="skipped",
+                    error_message=error_message,
+                ),
+                parse_seconds=result.parse_seconds,
+            )
+
+        write_started = time.perf_counter()
+        written_paths = writer.write_bars(df, raw_file.timeframe)
+        write_seconds = time.perf_counter() - write_started
+        parquet_path = str(written_paths[0]) if written_paths else None
+        outcome = IngestFileResult(status="committed", committed=True)
+        return IngestSymbolTaskResult(
+            symbol=symbol,
+            outcome=outcome,
+            file_ingest_row=_file_ingest_commit_row(
+                raw_file,
+                source_id=source_id,
+                symbol=symbol,
+                df=df,
+                parquet_path=parquet_path,
+            ),
+            symbol_records=tuple(_symbol_records(df)),
+            coverage_rows=tuple(_coverage_rows(df, raw_file.timeframe)),
+            parse_seconds=result.parse_seconds,
+            write_seconds=write_seconds,
+            written_paths=tuple(str(path) for path in written_paths),
+        )
+
+    def _failed_task_result(
+        self,
+        raw_file: LocalRawFile,
+        *,
+        source_id: str,
+        symbol: str,
+        error: Exception,
+    ) -> IngestSymbolTaskResult:
+        message = str(error)
+        return IngestSymbolTaskResult(
+            symbol=symbol,
+            outcome=IngestFileResult(status="failed", error_message=message),
+            file_ingest_row=_file_ingest_status_row(
+                raw_file,
+                source_id=source_id,
+                symbol=symbol,
+                status="failed",
+                error_message=message,
+            ),
+        )
+
+    def _record_task_metadata(self, task_results: list[IngestSymbolTaskResult]) -> None:
+        self.metadata.record_ingest_metadata_many(
+            symbol_records=[record for item in task_results for record in item.symbol_records],
+            coverage_rows=[row for item in task_results for row in item.coverage_rows],
+            file_ingest_rows=[
+                item.file_ingest_row
+                for item in task_results
+                if item.file_ingest_row is not None
+            ],
+        )
+
+    @staticmethod
+    def _log_task_timing(
+        raw_file: LocalRawFile,
+        source_id: str,
+        task_result: IngestSymbolTaskResult,
+        metadata_seconds: float,
+    ) -> None:
+        outcome = task_result.outcome
+        if outcome.committed:
+            logger.info(
+                "ingest symbol timing source_id=%s remote_path=%s symbol=%s status=committed rows=%s parse_seconds=%s write_seconds=%.3f metadata_seconds=%.3f parquet_paths=%s",
+                source_id,
+                raw_file.remote_path,
+                task_result.symbol,
+                task_result.file_ingest_row.get("row_count") if task_result.file_ingest_row else 0,
+                _seconds_text(task_result.parse_seconds),
+                task_result.write_seconds,
+                metadata_seconds,
+                len(task_result.written_paths),
+            )
+        else:
+            logger.info(
+                "ingest symbol timing source_id=%s remote_path=%s symbol=%s status=%s parse_seconds=%s metadata_seconds=%.3f error=%s",
+                source_id,
+                raw_file.remote_path,
+                task_result.symbol,
+                outcome.status,
+                _seconds_text(task_result.parse_seconds),
+                metadata_seconds,
+                outcome.error_message,
+            )
 
     def _mark_archive_status(
         self,
@@ -445,28 +758,100 @@ class Ingestor:
             self.metadata.upsert_symbol(symbol=symbol, code=code, name=name, exchange=symbol[:2])
 
     def _record_coverage(self, df: pd.DataFrame, timeframe: Timeframe) -> None:
-        expected = expected_intraday_rows(timeframe)
-        work = df.copy()
-        work["ts"] = pd.to_datetime(work["ts"])
-        work["trade_date"] = work["ts"].dt.date
-        rows: list[dict] = []
-        for (symbol, trade_date), group in work.groupby(["symbol", "trade_date"], sort=True):
-            row_count = int(len(group))
-            complete = row_count >= expected
-            rows.append(
-                {
-                    "symbol": symbol,
-                    "timeframe": timeframe.value,
-                    "trade_date": trade_date,
-                    "start_ts": group["ts"].min().to_pydatetime(),
-                    "end_ts": (group["ts"].max() + pd.Timedelta(minutes=timeframe.minute_span or 1)).to_pydatetime(),
-                    "row_count": row_count,
-                    "expected_row_count": expected,
-                    "is_complete": complete,
-                    "quality_flag": "ok" if complete else "partial",
-                }
-            )
-        self.metadata.update_coverage_daily_many(rows)
+        self.metadata.update_coverage_daily_many(_coverage_rows(df, timeframe))
+
+
+def _file_ingest_status_row(
+    raw_file: LocalRawFile,
+    *,
+    source_id: str,
+    symbol: str,
+    status: str,
+    error_message: str | None,
+) -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "remote_path": raw_file.remote_path,
+        "timeframe": raw_file.timeframe.value,
+        "symbol": symbol,
+        "start_ts": None,
+        "end_ts": None,
+        "row_count": 0,
+        "expected_row_count": None,
+        "content_hash": raw_file.content_hash,
+        "parquet_path": None,
+        "status": status,
+        "error_message": error_message,
+    }
+
+
+def _file_ingest_commit_row(
+    raw_file: LocalRawFile,
+    *,
+    source_id: str,
+    symbol: str,
+    df: pd.DataFrame,
+    parquet_path: str | None,
+) -> dict[str, Any]:
+    return {
+        "source_id": source_id,
+        "remote_path": raw_file.remote_path,
+        "timeframe": raw_file.timeframe.value,
+        "symbol": symbol,
+        "start_ts": _min_ts(df),
+        "end_ts": _exclusive_end(df, raw_file.timeframe),
+        "row_count": len(df),
+        "expected_row_count": expected_intraday_rows(raw_file.timeframe),
+        "content_hash": raw_file.content_hash,
+        "parquet_path": parquet_path,
+        "status": "committed",
+        "error_message": None,
+    }
+
+
+def _symbol_records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for symbol, group in df.groupby("symbol"):
+        code = str(group["code"].dropna().iloc[0]) if group["code"].notna().any() else symbol[2:]
+        name = str(group["name"].dropna().iloc[0]) if group["name"].notna().any() else None
+        records.append(
+            {
+                "symbol": symbol,
+                "code": code,
+                "name": name,
+                "exchange": symbol[:2],
+                "listed_at": None,
+                "delisted_at": None,
+                "status": None,
+                "source": "ingest",
+            }
+        )
+    return records
+
+
+def _coverage_rows(df: pd.DataFrame, timeframe: Timeframe) -> list[dict[str, Any]]:
+    expected = expected_intraday_rows(timeframe)
+    work = df.copy()
+    work["ts"] = pd.to_datetime(work["ts"])
+    work["trade_date"] = work["ts"].dt.date
+    rows: list[dict[str, Any]] = []
+    for (symbol, trade_date), group in work.groupby(["symbol", "trade_date"], sort=True):
+        row_count = int(len(group))
+        complete = row_count >= expected
+        rows.append(
+            {
+                "symbol": symbol,
+                "timeframe": timeframe.value,
+                "trade_date": trade_date,
+                "start_ts": group["ts"].min().to_pydatetime(),
+                "end_ts": (group["ts"].max() + pd.Timedelta(minutes=timeframe.minute_span or 1)).to_pydatetime(),
+                "row_count": row_count,
+                "expected_row_count": expected,
+                "is_complete": complete,
+                "quality_flag": "ok" if complete else "partial",
+            }
+        )
+    return rows
 
 
 def _min_ts(df: pd.DataFrame) -> dt.datetime | None:

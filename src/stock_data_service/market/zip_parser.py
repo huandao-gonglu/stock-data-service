@@ -141,6 +141,44 @@ class ZipBarParser:
             for normalized in normalized_symbols:
                 yield normalized, ParseResult(_empty(), "parse_failed", str(exc))
 
+    def parse_member(
+        self,
+        zip_path: str | Path,
+        symbol: str,
+        member_name: str | None,
+        *,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        source_path: str | None = None,
+        source: str = "baidu_netdisk",
+    ) -> ParseResult:
+        normalized = normalize_symbol(symbol)
+        if member_name is None:
+            return ParseResult(_empty(), "symbol_missing", f"{normalized} CSV not found")
+        parse_started = time.perf_counter()
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                content = archive.read(member_name)
+        except KeyError:
+            return ParseResult(_empty(), "symbol_missing", f"{normalized} CSV not found", time.perf_counter() - parse_started)
+        except zipfile.BadZipFile as exc:
+            return ParseResult(_empty(), "corrupted_zip", str(exc), time.perf_counter() - parse_started)
+        except Exception as exc:
+            return ParseResult(_empty(), "parse_failed", str(exc), time.perf_counter() - parse_started)
+
+        try:
+            parsed = self._parse_csv(
+                content,
+                normalized,
+                start=_to_shanghai_naive(start),
+                end=_to_shanghai_naive(end),
+                source_path=source_path,
+                source=source,
+            )
+        except Exception as exc:
+            return ParseResult(_empty(), "parse_failed", str(exc), time.perf_counter() - parse_started)
+        return ParseResult(parsed, "ok", parse_seconds=time.perf_counter() - parse_started)
+
     @staticmethod
     def _find_member(names: list[str], normalized: str, code: str) -> str | None:
         candidates = {

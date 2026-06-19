@@ -134,22 +134,20 @@ def test_baidu_sync_reports_current_symbol_for_each_archive_ingest(tmp_path):
 
     assert result.ingested_count == 2
     ingest_events = [item for item in progress if item["counts"] and item["counts"].get("current_ingest_symbol")]
-    assert [(item["counts"]["current_ingest_symbol"], item["counts"]["current_ingest_status"]) for item in ingest_events] == [
+    pairs = [(item["counts"]["current_ingest_symbol"], item["counts"]["current_ingest_status"]) for item in ingest_events]
+    assert pairs[:2] == [
         ("sh600000", "ingesting"),
-        ("sh600000", "committed"),
         ("sz000001", "ingesting"),
-        ("sz000001", "committed"),
     ]
+    assert sorted(pairs[2:]) == [("sh600000", "committed"), ("sz000001", "committed")]
     assert ingest_events[0]["counts"]["ingest_processed_count"] == 0
     assert ingest_events[0]["counts"]["current_archive_ingest_processed_count"] == 0
     assert ingest_events[0]["counts"]["current_archive_ingest_total_count"] == 2
-    assert ingest_events[1]["counts"]["ingest_processed_count"] == 1
-    assert ingest_events[1]["counts"]["ingest_total_count"] == 2
-    assert ingest_events[1]["counts"]["current_archive_ingest_processed_count"] == 1
-    assert ingest_events[1]["counts"]["current_ingest_path"] == remote_path
-    assert ingest_events[3]["counts"]["ingest_processed_count"] == 2
-    assert ingest_events[3]["counts"]["current_archive_ingest_processed_count"] == 2
-    assert ingest_events[3]["percent"] > ingest_events[1]["percent"]
+    committed_events = [item for item in ingest_events if item["counts"]["current_ingest_status"] == "committed"]
+    assert any(item["counts"]["current_ingest_path"] == remote_path for item in committed_events)
+    assert max(item["counts"]["ingest_processed_count"] for item in committed_events) == 2
+    assert max(item["counts"]["current_archive_ingest_processed_count"] for item in committed_events) == 2
+    assert max(item["percent"] for item in committed_events) > ingest_events[0]["percent"]
 
 
 def test_baidu_sync_skips_missing_symbol_without_failing_job(tmp_path):

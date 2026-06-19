@@ -1,3 +1,5 @@
+import datetime as dt
+
 from stock_data_service.config import Settings
 from stock_data_service.sync.manager import ManagedSyncJob, ManagedSyncRequest, SyncJobManager
 
@@ -24,6 +26,9 @@ def test_managed_sync_job_to_dict_omits_cancel_event():
     assert payload["current_archive_present_count"] is None
     assert payload["current_archive_missing_count"] == 0
     assert payload["current_ingest_symbol"] is None
+    assert payload["eta_seconds"] is None
+    assert payload["eta_confidence"] == "warming_up"
+    assert payload["progress_rate_percent_per_min"] is None
     assert "cancel_event" not in payload
 
 
@@ -198,3 +203,67 @@ def test_sync_manager_records_ingest_progress_details(tmp_path):
     assert payload["current_ingest_symbol"] == "sh600000"
     assert payload["current_ingest_path"] == "/A股_分时数据/1分钟_按年汇总/2024_1min.zip"
     assert payload["current_ingest_status"] == "committed"
+
+
+def test_finish_ingest_marks_total_done_and_clears_active_archive(tmp_path):
+    job = ManagedSyncJob(
+        id="job-1",
+        kind="baidu",
+        request=ManagedSyncRequest("baidu-main", "1m", "2000-01-01", "2026-06-19", ["sh600000"]),
+        ingest_processed_count=765,
+        ingest_total_count=1510,
+        current_archive_ingest_processed_count=3,
+        current_archive_ingest_total_count=5,
+        current_archive_requested_count=5,
+        current_archive_present_count=4,
+        current_archive_missing_count=1,
+        current_ingest_symbol="sh600000",
+        current_ingest_path="/x.zip",
+        current_ingest_status="committed",
+    )
+
+    SyncJobManager._finish_ingest(job)
+
+    payload = job.to_dict()
+    assert payload["ingest_processed_count"] == 1510
+    assert payload["ingest_total_count"] == 1510
+    assert payload["current_archive_ingest_processed_count"] == 0
+    assert payload["current_archive_ingest_total_count"] is None
+    assert payload["current_archive_requested_count"] is None
+    assert payload["current_archive_present_count"] is None
+    assert payload["current_archive_missing_count"] == 0
+    assert payload["current_ingest_symbol"] is None
+    assert payload["current_ingest_path"] is None
+    assert payload["current_ingest_status"] is None
+
+
+def test_eta_uses_smoothed_progress_rate(tmp_path, monkeypatch):
+    ticks = iter(
+        [
+            dt.datetime(2026, 6, 19, 9, 0, 0),
+            dt.datetime(2026, 6, 19, 9, 1, 0),
+            dt.datetime(2026, 6, 19, 9, 2, 0),
+        ]
+    )
+    monkeypatch.setattr("stock_data_service.sync.manager._now", lambda: next(ticks))
+    manager = SyncJobManager(Settings(data_root=tmp_path / "data"))
+    job = ManagedSyncJob(
+        id="job-1",
+        kind="baidu",
+        request=ManagedSyncRequest("baidu-main", "1m", "2000-01-01", "2026-06-19", ["sh600000"]),
+        status="running",
+        progress_percent=5,
+    )
+    manager._jobs[job.id] = job
+    manager._active_job_id = job.id
+    SyncJobManager._prime_eta(job)
+
+    manager._update_progress(job.id, "scan", 35, counts={"scanned_count": 1})
+    assert job.eta_seconds == 130
+    assert job.eta_confidence == "warming_up"
+    assert job.progress_rate_percent_per_min == 30
+
+    manager._update_progress(job.id, "scan", 65, counts={"scanned_count": 2})
+    assert job.eta_seconds == 70
+    assert job.eta_confidence == "stable"
+    assert job.progress_rate_percent_per_min == 30

@@ -7,13 +7,13 @@ from stock_data_service.market.timeframe import Timeframe
 from stock_data_service.storage.parquet_writer import ParquetBarWriter
 
 
-def _bars(close=9.57, ts=dt.datetime(2024, 12, 20, 9, 30)):
+def _bars(close=9.57, ts=dt.datetime(2024, 12, 20, 9, 30), name="test-name"):
     return pd.DataFrame(
         [
             {
                 "symbol": "sh600000",
                 "code": "sh600000",
-                "name": "浦发银行",
+                "name": name,
                 "ts": ts,
                 "open": 9.57,
                 "high": 9.57,
@@ -50,6 +50,17 @@ def test_appends_another_day_for_same_symbol_month_and_keeps_canonical_columns(t
     assert len(df) == 2
     assert list(df.columns) == INTRADAY_COLUMNS
     assert list(df["close"]) == [1, 2]
+
+
+def test_merges_existing_partition_when_new_name_is_numeric(tmp_path):
+    writer = ParquetBarWriter(tmp_path / "parquet")
+    [path] = writer.write_bars(_bars(name="name-text"), Timeframe.M1)
+    writer.write_bars(_bars(name=600000, ts=dt.datetime(2024, 12, 20, 9, 31)), Timeframe.M1)
+
+    df = pd.read_parquet(path)
+
+    assert len(df) == 2
+    assert list(df["name"]) == ["name-text", "600000"]
 
 
 def test_new_partition_fast_path_does_not_read_existing_parquet(tmp_path, monkeypatch):

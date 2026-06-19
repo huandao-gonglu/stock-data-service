@@ -1000,6 +1000,7 @@ _ADMIN_HTML = """<!doctype html>
             <span id="activeStatus" class="pill">无运行任务</span>
             <span id="activeCounts" class="pill">0 / 0 / 0</span>
             <span id="downloadSpeed" class="pill">速度 0 B/s</span>
+            <span id="etaDetail" class="pill">预计 -</span>
             <span id="ingestDetail" class="pill">入库 -</span>
           </div>
           <div class="progress-row">
@@ -1132,6 +1133,34 @@ _ADMIN_HTML = """<!doctype html>
     function formatRate(value) {
       return `${formatBytes(value)}/s`;
     }
+    function formatDuration(seconds) {
+      const total = Math.max(0, Math.round(Number(seconds || 0)));
+      const days = Math.floor(total / 86400);
+      const hours = Math.floor((total % 86400) / 3600);
+      const minutes = Math.floor((total % 3600) / 60);
+      const secs = total % 60;
+      if (days > 0) return hours > 0 ? `${days}天${hours}小时` : `${days}天`;
+      if (hours > 0) return minutes > 0 ? `${hours}小时${minutes}分钟` : `${hours}小时`;
+      if (minutes > 0) return secs > 0 && minutes < 10 ? `${minutes}分钟${secs}秒` : `${minutes}分钟`;
+      return `${secs}秒`;
+    }
+    function etaConfidenceLabel(value) {
+      return ({
+        warming_up: "估算中",
+        stable: "稳定",
+        volatile: "波动"
+      }[value] || "");
+    }
+    function etaDisplay(active) {
+      if (!active || active.eta_seconds === null || active.eta_seconds === undefined) {
+        return "预计 估算中";
+      }
+      const confidence = etaConfidenceLabel(active.eta_confidence);
+      const rate = Number(active.progress_rate_percent_per_min || 0);
+      const rateText = rate > 0 ? ` · ${rate >= 10 ? rate.toFixed(0) : rate.toFixed(1)}%/分钟` : "";
+      const confidenceText = confidence && confidence !== "稳定" ? ` · ${confidence}` : "";
+      return `预计剩余 ${formatDuration(active.eta_seconds)}${confidenceText}${rateText}`;
+    }
     function headers() {
       const key = apiKeyInput.value.trim();
       return key ? {"Content-Type": "application/json", "X-API-Key": key} : {"Content-Type": "application/json"};
@@ -1258,6 +1287,7 @@ _ADMIN_HTML = """<!doctype html>
         const totalText = totalBytes ? ` / ${formatBytes(totalBytes)}` : "";
         const nameText = active.current_download_path ? ` · ${fileName(active.current_download_path)}` : "";
         $("downloadSpeed").textContent = `速度 ${formatRate(speed)}${downloadedBytes ? ` · ${formatBytes(downloadedBytes)}${totalText}` : ""}${nameText}`;
+        $("etaDetail").textContent = etaDisplay(active);
         const ingestSymbol = active.current_ingest_symbol || "";
         const ingestPath = active.current_ingest_path ? ` · ${fileName(active.current_ingest_path)}` : "";
         const ingestStatus = ingestStatusLabel(active.current_ingest_status);
@@ -1271,6 +1301,7 @@ _ADMIN_HTML = """<!doctype html>
         $("activeStatus").textContent = "无运行任务";
         $("activeCounts").textContent = "扫描 0 · 下载 0 · 入库 0 · 失败 0";
         $("downloadSpeed").textContent = "速度 0 B/s";
+        $("etaDetail").textContent = "预计 -";
         $("ingestDetail").textContent = "入库 -";
         $("progressBar").style.width = "0%";
         $("progressText").textContent = "0%";

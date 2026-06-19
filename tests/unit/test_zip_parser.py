@@ -115,6 +115,27 @@ def test_symbol_member_index_selects_present_and_missing_symbols(tmp_path):
     assert selection.missing_symbols == ["sh600004"]
 
 
+def test_parse_member_reads_one_archive_member(tmp_path):
+    zip_path = tmp_path / "2000_1min.zip"
+    _write_multi_symbol_zip(zip_path)
+
+    parser = ZipBarParser()
+    result = parser.parse_member(zip_path, "sz000001", "sz000001.csv", source_path="/x.zip")
+
+    assert result.status == "ok"
+    assert list(result.dataframe["symbol"].unique()) == ["sz000001"]
+    assert parser.parse_member(zip_path, "sh600004", None).status == "symbol_missing"
+
+
+def test_numeric_text_fields_are_normalized_to_strings():
+    rows = sample_rows(symbol=600000, name=600000)
+    result = ZipBarParser().parse(make_zip(rows), "sh600000")
+
+    assert result.status == "ok"
+    assert result.dataframe.iloc[0]["code"] == "600000"
+    assert result.dataframe.iloc[0]["name"] == "600000"
+
+
 def test_iter_parse_archive_isolates_member_parse_failures(tmp_path):
     zip_path = tmp_path / "20241220_1min.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:

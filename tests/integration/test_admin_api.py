@@ -50,6 +50,9 @@ class FakeSyncManager:
             "current_ingest_symbol": None,
             "current_ingest_path": None,
             "current_ingest_status": None,
+            "eta_seconds": None,
+            "eta_confidence": "warming_up",
+            "progress_rate_percent_per_min": None,
             "error_message": None,
         }
         return FakeJob(self.active)
@@ -82,6 +85,9 @@ class FakeSyncManager:
             "current_ingest_symbol": None,
             "current_ingest_path": None,
             "current_ingest_status": None,
+            "eta_seconds": None,
+            "eta_confidence": "warming_up",
+            "progress_rate_percent_per_min": None,
             "error_message": None,
         }
         return FakeJob(self.active)
@@ -151,8 +157,12 @@ def test_admin_page_and_settings_roundtrip(tmp_path):
     assert 'id="baiduAuthStatus"' in page.text
     assert 'id="authorizeBaiduBtn"' in page.text
     assert 'id="fullSyncBtn"' in page.text
+    assert 'id="etaDetail"' in page.text
     assert 'id="ingestDetail"' in page.text
     assert "current_ingest_symbol" in page.text
+    assert "eta_seconds" in page.text
+    assert "progress_rate_percent_per_min" in page.text
+    assert "formatDuration" in page.text
     assert "ingest_processed_count" in page.text
     assert "current_archive_ingest_processed_count" in page.text
     assert "当前归档" in page.text

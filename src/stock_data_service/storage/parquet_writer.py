@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from stock_data_service.market.normalizer import DAILY_COLUMNS, INTRADAY_COLUMNS, canonical_intraday
+from stock_data_service.market.normalizer import DAILY_COLUMNS, INTRADAY_COLUMNS, canonical_daily, canonical_intraday
 from stock_data_service.market.timeframe import Timeframe
 from stock_data_service.sync.locks import partition_lock
 
@@ -68,12 +68,7 @@ class ParquetBarWriter:
         return written
 
     def _write_daily(self, dataframe: pd.DataFrame) -> list[Path]:
-        df = dataframe.copy()
-        for col in DAILY_COLUMNS:
-            if col not in df.columns:
-                df[col] = None
-        df = df[DAILY_COLUMNS]
-        df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
+        df = canonical_daily(dataframe)
         ts = pd.to_datetime(df["trade_date"])
         df["year"] = ts.dt.year
         df["month"] = ts.dt.month
