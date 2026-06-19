@@ -290,6 +290,7 @@ class BaiduSyncJobRunner:
         downloaded = 0
         ingested = 0
         failed = 0
+        completed_archives = 0
         try:
             normalized_symbols = [normalize_symbol(symbol) for symbol in symbols]
             candidate_dates = _candidate_trade_dates(self.path_strategy.candidates_for_range(timeframe, start, end))
@@ -350,6 +351,7 @@ class BaiduSyncJobRunner:
                     ingested,
                     failed,
                     planned_download_count=planned_download_count,
+                    completed_archive_count=completed_archives,
                             ingest_processed_count=ingest_processed,
                             ingest_total_count=ingest_total,
                             current_archive_ingest_processed_count=0,
@@ -419,6 +421,7 @@ class BaiduSyncJobRunner:
                             ingested,
                             failed,
                             planned_download_count=max(planned_download_count, scanned),
+                            completed_archive_count=completed_archives,
                             ingest_processed_count=ingest_processed,
                             ingest_total_count=max(ingest_total, downloaded * len(normalized_symbols), ingest_processed),
                             current_archive_ingest_processed_count=0,
@@ -426,6 +429,7 @@ class BaiduSyncJobRunner:
                         ),
                     )
                     if not result.remote_path:
+                        completed_archives += 1
                         _report_progress(
                             progress_callback,
                             "未找到远端文件",
@@ -436,6 +440,7 @@ class BaiduSyncJobRunner:
                                 ingested,
                                 failed,
                                 planned_download_count=max(planned_download_count, scanned),
+                                completed_archive_count=completed_archives,
                                 ingest_processed_count=ingest_processed,
                                 ingest_total_count=max(ingest_total, downloaded * len(normalized_symbols), ingest_processed),
                                 current_archive_ingest_processed_count=0,
@@ -452,6 +457,24 @@ class BaiduSyncJobRunner:
                         continue
 
                     if result.status == "missing":
+                        completed_archives += 1
+                        _report_progress(
+                            progress_callback,
+                            "候选文件缺失",
+                            35,
+                            counts=_counts_payload(
+                                scanned,
+                                downloaded,
+                                ingested,
+                                failed,
+                                planned_download_count=max(planned_download_count, scanned),
+                                completed_archive_count=completed_archives,
+                                ingest_processed_count=ingest_processed,
+                                ingest_total_count=max(ingest_total, downloaded * len(normalized_symbols), ingest_processed),
+                                current_archive_ingest_processed_count=0,
+                                current_archive_ingest_total_count=len(normalized_symbols),
+                            ),
+                        )
                         logger.info(
                             "baidu sync candidate missing job_id=%s remote_path=%s trade_date=%s",
                             job_id,
@@ -472,6 +495,7 @@ class BaiduSyncJobRunner:
 
                     if result.status == "failed" or result.local_path is None or result.content_hash is None:
                         failed += 1
+                        completed_archives += 1
                         _report_progress(
                             progress_callback,
                             "下载失败",
@@ -482,6 +506,7 @@ class BaiduSyncJobRunner:
                                 ingested,
                                 failed,
                                 planned_download_count=max(planned_download_count, scanned),
+                                completed_archive_count=completed_archives,
                                 ingest_processed_count=ingest_processed,
                                 ingest_total_count=max(ingest_total, downloaded * len(normalized_symbols), ingest_processed),
                                 current_archive_ingest_processed_count=0,
@@ -512,6 +537,7 @@ class BaiduSyncJobRunner:
                             ingested,
                             failed,
                             planned_download_count=max(planned_download_count, scanned),
+                            completed_archive_count=completed_archives,
                             ingest_processed_count=ingest_processed,
                             ingest_total_count=max(ingest_total, downloaded * len(normalized_symbols), ingest_processed),
                             current_archive_ingest_processed_count=0,
@@ -570,6 +596,7 @@ class BaiduSyncJobRunner:
                                 ingested + archive_committed,
                                 failed + archive_failed,
                                 planned_download_count=max(planned_download_count, scanned),
+                                completed_archive_count=completed_archives,
                                 ingest_processed_count=ingest_processed,
                                 ingest_total_count=current_ingest_total,
                                 current_archive_ingest_processed_count=archive_processed,
@@ -595,6 +622,7 @@ class BaiduSyncJobRunner:
                     ingested += outcome.committed_count
                     failed += outcome.failed_count
                     current_ingest_total = max(ingest_total, downloaded * len(normalized_symbols), ingest_processed)
+                    completed_archives += 1
                     _report_progress(
                         progress_callback,
                         f"Archive processed {Path(result.remote_path).name}",
@@ -605,6 +633,7 @@ class BaiduSyncJobRunner:
                             ingested,
                             failed,
                             planned_download_count=max(planned_download_count, scanned),
+                            completed_archive_count=completed_archives,
                             ingest_processed_count=ingest_processed,
                             ingest_total_count=current_ingest_total,
                             current_archive_ingest_processed_count=archive_processed,
@@ -702,6 +731,7 @@ class BaiduSyncJobRunner:
         downloaded = 0
         ingested = 0
         failed = 0
+        completed_archives = 0
         ingest_processed = 0
         ingest_total = len(symbols)
         try:
@@ -715,6 +745,7 @@ class BaiduSyncJobRunner:
                     ingested,
                     failed,
                     planned_download_count=1,
+                    completed_archive_count=completed_archives,
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=0,
@@ -745,6 +776,7 @@ class BaiduSyncJobRunner:
 
             if result.status == "missing":
                 failed = 1
+                completed_archives = 1
                 _report_progress(
                     progress_callback,
                     "远端文件不存在",
@@ -755,6 +787,7 @@ class BaiduSyncJobRunner:
                         ingested,
                         failed,
                         planned_download_count=1,
+                        completed_archive_count=completed_archives,
                         ingest_processed_count=ingest_processed,
                         ingest_total_count=ingest_total,
                         current_archive_ingest_processed_count=0,
@@ -775,6 +808,7 @@ class BaiduSyncJobRunner:
 
             if result.status == "failed" or result.local_path is None or result.content_hash is None:
                 failed = 1
+                completed_archives = 1
                 _report_progress(
                     progress_callback,
                     "下载失败",
@@ -785,6 +819,7 @@ class BaiduSyncJobRunner:
                         ingested,
                         failed,
                         planned_download_count=1,
+                        completed_archive_count=completed_archives,
                         ingest_processed_count=ingest_processed,
                         ingest_total_count=ingest_total,
                         current_archive_ingest_processed_count=0,
@@ -815,6 +850,7 @@ class BaiduSyncJobRunner:
                     ingested,
                     failed,
                     planned_download_count=1,
+                    completed_archive_count=completed_archives,
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=0,
@@ -873,6 +909,7 @@ class BaiduSyncJobRunner:
                         ingested + archive_committed,
                         failed + archive_failed,
                         planned_download_count=1,
+                        completed_archive_count=completed_archives,
                         ingest_processed_count=ingest_processed,
                         ingest_total_count=ingest_total,
                         current_archive_ingest_processed_count=archive_processed,
@@ -897,6 +934,7 @@ class BaiduSyncJobRunner:
             )
             ingested += outcome.committed_count
             failed += outcome.failed_count
+            completed_archives = 1
             _report_progress(
                 progress_callback,
                 f"Archive processed {Path(result.remote_path).name}",
@@ -907,6 +945,7 @@ class BaiduSyncJobRunner:
                     ingested,
                     failed,
                     planned_download_count=1,
+                    completed_archive_count=completed_archives,
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=archive_processed,
@@ -936,6 +975,7 @@ class BaiduSyncJobRunner:
                     ingested,
                     failed,
                     planned_download_count=1,
+                    completed_archive_count=completed_archives,
                     ingest_processed_count=ingest_processed,
                     ingest_total_count=ingest_total,
                     current_archive_ingest_processed_count=archive_processed,
@@ -1141,6 +1181,7 @@ def _counts_payload(
     failed: int,
     *,
     planned_download_count: int | None = None,
+    completed_archive_count: int | None = None,
     ingest_processed_count: int = 0,
     ingest_total_count: int | None = None,
     current_archive_ingest_processed_count: int = 0,
@@ -1161,6 +1202,8 @@ def _counts_payload(
     }
     if planned_download_count is not None:
         payload["planned_download_count"] = planned_download_count
+    if completed_archive_count is not None:
+        payload["completed_archive_count"] = completed_archive_count
     if ingest_total_count is not None:
         payload["ingest_total_count"] = ingest_total_count
     payload["current_archive_ingest_processed_count"] = current_archive_ingest_processed_count

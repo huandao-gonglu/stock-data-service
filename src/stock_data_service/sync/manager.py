@@ -16,6 +16,10 @@ from stock_data_service.sync.job_runner import BaiduSyncJobRunner, SyncCancelled
 
 logger = logging.getLogger(__name__)
 
+_ETA_ARCHIVE_START_PERCENT = 10.0
+_ETA_ARCHIVE_SPAN_PERCENT = 88.0
+_ETA_ARCHIVE_DOWNLOAD_FRACTION = 0.4
+
 ManagedSyncStatus = Literal["queued", "running", "completed", "completed_with_errors", "failed", "stopping", "stopped"]
 
 
@@ -96,6 +100,7 @@ class ManagedSyncJob:
     ingested_count: int = 0
     failed_count: int = 0
     planned_download_count: int | None = None
+    completed_archive_count: int = 0
     ingest_processed_count: int = 0
     ingest_total_count: int | None = None
     current_archive_ingest_processed_count: int = 0
@@ -136,6 +141,7 @@ class ManagedSyncJob:
             "ingested_count": self.ingested_count,
             "failed_count": self.failed_count,
             "planned_download_count": self.planned_download_count,
+            "completed_archive_count": self.completed_archive_count,
             "ingest_processed_count": self.ingest_processed_count,
             "ingest_total_count": self.ingest_total_count,
             "current_archive_ingest_processed_count": self.current_archive_ingest_processed_count,
@@ -354,6 +360,8 @@ class SyncJobManager:
                     job.failed_count = int(counts.get("failed_count") or 0)
                 if "planned_download_count" in counts:
                     job.planned_download_count = _optional_int(counts.get("planned_download_count"))
+                if "completed_archive_count" in counts:
+                    job.completed_archive_count = int(counts.get("completed_archive_count") or 0)
                 if "ingest_processed_count" in counts:
                     job.ingest_processed_count = int(counts.get("ingest_processed_count") or 0)
                 if "ingest_total_count" in counts:
@@ -466,6 +474,11 @@ class SyncJobManager:
 
     @staticmethod
     def _eta_progress_value(job: ManagedSyncJob) -> float:
+        if job.progress_percent >= 100:
+            return 100.0
+        count_progress = SyncJobManager._eta_count_progress_value(job)
+        if count_progress is not None:
+            return count_progress
         progress = float(max(0, min(job.progress_percent, 100)))
         if job.ingest_total_count and job.ingest_total_count > 0 and (
             progress >= 45 or job.downloaded_count > 0 or job.ingest_processed_count > 0
@@ -476,6 +489,56 @@ class SyncJobManager:
             scan_ratio = min(max(job.scanned_count, 0) / max(job.planned_download_count, 1), 1.0)
             progress = max(progress, 10.0 + scan_ratio * 35.0)
         return max(0.0, min(progress, 100.0))
+
+    @staticmethod
+    def _eta_count_progress_value(job: ManagedSyncJob) -> float | None:
+        planned = job.planned_download_count
+        if planned is not None and planned > 0:
+            completed_units = min(max(job.completed_archive_count, 0), planned)
+            current_fraction = SyncJobManager._eta_current_archive_fraction(job, completed_units, planned)
+            archive_ratio = min((completed_units + current_fraction) / planned, 1.0)
+            progress = _ETA_ARCHIVE_START_PERCENT + archive_ratio * _ETA_ARCHIVE_SPAN_PERCENT
+            return max(0.0, min(progress, 98.0))
+
+        ingest_total = job.ingest_total_count
+        if ingest_total is not None and ingest_total > 0 and job.ingest_processed_count > 0:
+            ingest_ratio = min(max(job.ingest_processed_count, 0) / ingest_total, 1.0)
+            return max(0.0, min(45.0 + ingest_ratio * 53.0, 98.0))
+
+        return None
+
+    @staticmethod
+    def _eta_current_archive_fraction(job: ManagedSyncJob, completed_units: int, planned_units: int) -> float:
+        if completed_units >= planned_units:
+            return 0.0
+
+        download_fraction = SyncJobManager._eta_current_download_fraction(job)
+        if download_fraction > 0:
+            return min(download_fraction * _ETA_ARCHIVE_DOWNLOAD_FRACTION, _ETA_ARCHIVE_DOWNLOAD_FRACTION)
+
+        if job.downloaded_count <= completed_units:
+            return 0.0
+
+        ingest_fraction = SyncJobManager._eta_current_archive_ingest_fraction(job)
+        return min(_ETA_ARCHIVE_DOWNLOAD_FRACTION + ingest_fraction * (1.0 - _ETA_ARCHIVE_DOWNLOAD_FRACTION), 1.0)
+
+    @staticmethod
+    def _eta_current_download_fraction(job: ManagedSyncJob) -> float:
+        if not job.current_download_path or not job.download_total_bytes or job.download_total_bytes <= 0:
+            return 0.0
+        return min(max(job.downloaded_bytes, 0) / job.download_total_bytes, 1.0)
+
+    @staticmethod
+    def _eta_current_archive_ingest_fraction(job: ManagedSyncJob) -> float:
+        present = job.current_archive_present_count
+        if present is None:
+            present = job.current_archive_ingest_total_count
+        if present is None:
+            return 0.0
+        if present <= 0:
+            return 1.0
+        processed = max(job.current_archive_ingest_processed_count, 0)
+        return min(processed / present, 1.0)
 
     @staticmethod
     def _finish_ingest(job: ManagedSyncJob) -> None:

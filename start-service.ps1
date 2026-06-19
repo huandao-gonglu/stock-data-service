@@ -3,14 +3,14 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = $PSScriptRoot
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 
-$HostAddress = "127.0.0.1"
+$HostAddress = "0.0.0.0"
 $Port = 8000
 
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Python executable not found at $Python. Create the virtual environment first."
 }
 
-$listeners = Get-NetTCPConnection -LocalAddress $HostAddress -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+$listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
 $processIds = $listeners | Select-Object -ExpandProperty OwningProcess -Unique
 
 foreach ($processId in $processIds) {

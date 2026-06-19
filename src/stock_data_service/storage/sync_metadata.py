@@ -486,9 +486,17 @@ class SyncMetadata:
                     con.register("bulk_ingest_symbols", symbols_frame)
                     con.execute(
                         """
-                        DELETE FROM symbols
-                        USING bulk_ingest_symbols
+                        UPDATE symbols
+                        SET
+                            code = COALESCE(NULLIF(bulk_ingest_symbols.code, ''), symbols.code),
+                            name = COALESCE(NULLIF(bulk_ingest_symbols.name, ''), symbols.name),
+                            exchange = COALESCE(NULLIF(bulk_ingest_symbols.exchange, ''), symbols.exchange),
+                            source = COALESCE(symbols.source, bulk_ingest_symbols.source),
+                            updated_at = bulk_ingest_symbols.updated_at
+                        FROM bulk_ingest_symbols
                         WHERE symbols.symbol = bulk_ingest_symbols.symbol
+                          AND symbols.status IS NULL
+                          AND (symbols.source IS NULL OR symbols.source = 'ingest')
                         """
                     )
                     con.execute(
@@ -496,7 +504,10 @@ class SyncMetadata:
                         INSERT INTO symbols
                         (symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at)
                         SELECT symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at
-                        FROM bulk_ingest_symbols
+                        FROM bulk_ingest_symbols AS incoming
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM symbols WHERE symbols.symbol = incoming.symbol
+                        )
                         """
                     )
 
@@ -665,6 +676,44 @@ class SyncMetadata:
         status: str | None = None,
         source: str | None = None,
     ) -> None:
+        if status is None and listed_at is None and delisted_at is None and (source is None or source == "ingest"):
+            now = _now()
+            ingest_source = source or "ingest"
+            with self.connect() as con:
+                con.execute("BEGIN TRANSACTION")
+                try:
+                    con.execute(
+                        """
+                        UPDATE symbols
+                        SET
+                            code = COALESCE(NULLIF(?, ''), symbols.code),
+                            name = COALESCE(NULLIF(?, ''), symbols.name),
+                            exchange = COALESCE(NULLIF(?, ''), symbols.exchange),
+                            source = COALESCE(symbols.source, ?),
+                            updated_at = ?
+                        WHERE symbol = ?
+                          AND symbols.status IS NULL
+                          AND (symbols.source IS NULL OR symbols.source = 'ingest')
+                        """,
+                        [code, name, exchange, ingest_source, now, symbol],
+                    )
+                    con.execute(
+                        """
+                        INSERT INTO symbols
+                        (symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at)
+                        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM symbols WHERE symbol = ?
+                        )
+                        """,
+                        [symbol, code, name, exchange, listed_at, delisted_at, status, ingest_source, now, symbol],
+                    )
+                    con.execute("COMMIT")
+                except Exception:
+                    con.execute("ROLLBACK")
+                    raise
+            return
+
         with self.connect() as con:
             con.execute("DELETE FROM symbols WHERE symbol = ?", [symbol])
             con.execute(

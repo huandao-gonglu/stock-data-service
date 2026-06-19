@@ -147,6 +147,71 @@ def test_upserts_symbol_listing_metadata(metadata):
     ) == ("sh600000", "600000", "浦发银行", "sh", dt.date(1999, 11, 10), None, "listed", "baostock")
 
 
+def test_batch_ingest_symbols_do_not_overwrite_authoritative_listing_metadata(metadata):
+    metadata.upsert_symbols(
+        [
+            SecurityListing(
+                symbol="sh600000",
+                code="600000",
+                name="Official Name",
+                exchange="sh",
+                listed_at=dt.date(1999, 11, 10),
+                delisted_at=None,
+                status="listed",
+                source="baostock",
+            )
+        ]
+    )
+
+    metadata.record_ingest_metadata_many(
+        symbol_records=[
+            {
+                "symbol": "sh600000",
+                "code": "600000",
+                "name": "Archive Name",
+                "exchange": "sh",
+                "source": "ingest",
+            },
+            {
+                "symbol": "sz000001",
+                "code": "000001",
+                "name": "Archive Only",
+                "exchange": "sz",
+                "source": "ingest",
+            },
+        ]
+    )
+
+    assert metadata.fetchone(
+        "SELECT name, listed_at, status, source FROM symbols WHERE symbol = 'sh600000'"
+    ) == ("Official Name", dt.date(1999, 11, 10), "listed", "baostock")
+    assert metadata.fetchone(
+        "SELECT name, listed_at, status, source FROM symbols WHERE symbol = 'sz000001'"
+    ) == ("Archive Only", None, None, "ingest")
+
+
+def test_single_ingest_symbol_does_not_overwrite_authoritative_listing_metadata(metadata):
+    metadata.upsert_symbol(
+        symbol="sh600000",
+        code="600000",
+        name="Official Name",
+        exchange="sh",
+        listed_at=dt.date(1999, 11, 10),
+        status="listed",
+        source="baostock",
+    )
+
+    metadata.upsert_symbol(symbol="sh600000", code="600000", name="Archive Name", exchange="sh")
+    metadata.upsert_symbol(symbol="sz000001", code="000001", name="Archive Only", exchange="sz")
+
+    assert metadata.fetchone(
+        "SELECT name, listed_at, status, source FROM symbols WHERE symbol = 'sh600000'"
+    ) == ("Official Name", dt.date(1999, 11, 10), "listed", "baostock")
+    assert metadata.fetchone(
+        "SELECT name, listed_at, status, source FROM symbols WHERE symbol = 'sz000001'"
+    ) == ("Archive Only", None, None, "ingest")
+
+
 def test_coverage_and_sync_job_counters(metadata):
     metadata.update_coverage_daily(
         symbol="sh600000",
