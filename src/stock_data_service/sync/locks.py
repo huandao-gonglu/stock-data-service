@@ -37,6 +37,8 @@ class ProcessLock:
                 os.write(self._fd, str(os.getpid()).encode("ascii"))
                 return self
             except FileExistsError:
+                if self._clear_stale_lock():
+                    continue
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f"sync lock is already held: {self.path}")
                 time.sleep(0.05)
@@ -49,3 +51,43 @@ class ProcessLock:
             self.path.unlink()
         except FileNotFoundError:
             pass
+
+    def _clear_stale_lock(self) -> bool:
+        try:
+            text = self.path.read_text(encoding="ascii").strip()
+            pid = int(text)
+        except (FileNotFoundError, ValueError, OSError):
+            return False
+        if _process_exists(pid):
+            return False
+        try:
+            self.path.unlink()
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        return True
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        exit_code = ctypes.c_ulong()
+        try:
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True

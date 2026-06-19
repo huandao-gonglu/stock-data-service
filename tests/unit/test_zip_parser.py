@@ -2,6 +2,8 @@ import datetime as dt
 import io
 import zipfile
 
+import pandas as pd
+
 from conftest import make_zip, sample_rows
 from stock_data_service.market.normalizer import INTRADAY_COLUMNS
 from stock_data_service.market.zip_parser import ZipBarParser
@@ -23,6 +25,13 @@ def test_accepts_full_symbol_member_and_suffix_symbol_input_variants():
     assert ZipBarParser().parse(payload, "600000.SH").status == "ok"
     assert ZipBarParser().parse(payload, "sh600000").status == "ok"
     assert ZipBarParser().parse(payload, "600000").status == "ok"
+
+
+def test_accepts_annual_archive_symbol_member_names():
+    payload = make_zip(sample_rows(), member="sh600000_2002.csv")
+    result = ZipBarParser().parse(payload, "sh600000")
+    assert result.status == "ok"
+    assert len(result.dataframe) == 2
 
 
 def test_extracts_symbol_csv_from_nested_folder_and_gbk():
@@ -58,3 +67,80 @@ def test_parse_failed_is_not_empty_success():
         archive.writestr("600000.csv", "not,a,valid\n1,2")
     result = ZipBarParser().parse(buffer.getvalue(), "600000")
     assert result.status == "parse_failed"
+
+
+def test_iter_parse_archive_builds_one_index_and_yields_symbol_results(tmp_path, monkeypatch):
+    zip_path = tmp_path / "20241220_1min.zip"
+    _write_multi_symbol_zip(zip_path)
+    open_count = 0
+    original_zip_file = zipfile.ZipFile
+
+    class CountingZipFile(original_zip_file):
+        def __init__(self, *args, **kwargs):
+            nonlocal open_count
+            open_count += 1
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("stock_data_service.market.zip_parser.zipfile.ZipFile", CountingZipFile)
+
+    results = list(
+        ZipBarParser().iter_parse_archive(
+            zip_path,
+            ["sh600000", "sz000001", "sh600004"],
+            source_path="/x.zip",
+        )
+    )
+
+    assert open_count == 1
+    assert [(symbol, result.status) for symbol, result in results] == [
+        ("sh600000", "ok"),
+        ("sz000001", "ok"),
+        ("sh600004", "symbol_missing"),
+    ]
+    assert list(results[0][1].dataframe["symbol"].unique()) == ["sh600000"]
+    assert list(results[1][1].dataframe["symbol"].unique()) == ["sz000001"]
+
+
+def test_iter_parse_archive_isolates_member_parse_failures(tmp_path):
+    zip_path = tmp_path / "20241220_1min.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "sh600000.csv",
+            pd.DataFrame(sample_rows(symbol="sh600000")).to_csv(index=False).encode("utf-8-sig"),
+        )
+        archive.writestr("sz000001.csv", "not,a,valid\n1,2")
+
+    results = list(ZipBarParser().iter_parse_archive(zip_path, ["sh600000", "sz000001"]))
+
+    assert [(symbol, result.status) for symbol, result in results] == [
+        ("sh600000", "ok"),
+        ("sz000001", "parse_failed"),
+    ]
+    assert len(results[0][1].dataframe) == 2
+
+
+def test_iter_parse_archive_applies_half_open_range_per_symbol(tmp_path):
+    zip_path = tmp_path / "20241220_1min.zip"
+    _write_multi_symbol_zip(zip_path)
+
+    results = dict(
+        ZipBarParser().iter_parse_archive(
+            zip_path,
+            ["sh600000", "sz000001"],
+            start=dt.datetime(2024, 12, 20, 9, 30),
+            end=dt.datetime(2024, 12, 20, 9, 31),
+        )
+    )
+
+    assert results["sh600000"].status == "ok"
+    assert results["sz000001"].status == "ok"
+    assert len(results["sh600000"].dataframe) == 1
+    assert len(results["sz000001"].dataframe) == 1
+    assert results["sh600000"].dataframe.iloc[0]["ts"] == pd.Timestamp("2024-12-20 09:30:00")
+
+
+def _write_multi_symbol_zip(path):
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for symbol in ["sh600000", "sz000001"]:
+            payload = pd.DataFrame(sample_rows(symbol=symbol)).to_csv(index=False).encode("utf-8-sig")
+            archive.writestr(f"{symbol}.csv", payload)

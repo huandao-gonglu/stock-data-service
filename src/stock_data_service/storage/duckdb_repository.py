@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import duckdb
 import pandas as pd
 
-from stock_data_service.market.calendar import SimpleTradingCalendar
+from stock_data_service.market.calendar import SSETradingCalendar
 from stock_data_service.market.timeframe import Timeframe
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -79,7 +79,7 @@ class DuckDBRepository:
 
         trade_dates = [row[0] for row in rows]
         present = set(trade_dates)
-        calendar_days = SimpleTradingCalendar().get_trading_days(min(trade_dates), max(trade_dates))
+        calendar_days = SSETradingCalendar().get_trading_days(min(trade_dates), max(trade_dates))
         complete_count = sum(1 for row in rows if bool(row[5]))
         partial_count = sum(1 for row in rows if not bool(row[5]) or row[6] != "ok")
         missing_count = sum(1 for day in calendar_days if day not in present)
@@ -118,7 +118,7 @@ class DuckDBRepository:
         by_date = {row[0]: row for row in rows}
         missing: list[str] = []
         partial: list[dict] = []
-        for day in SimpleTradingCalendar().get_trading_days(start, end):
+        for day in SSETradingCalendar().get_trading_days(start, end):
             row = by_date.get(day)
             if row is None:
                 missing.append(day.isoformat())

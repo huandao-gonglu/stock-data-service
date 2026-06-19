@@ -42,6 +42,14 @@ class FakeSyncManager:
             "downloaded_count": 0,
             "ingested_count": 0,
             "failed_count": 0,
+            "planned_download_count": None,
+            "ingest_processed_count": 0,
+            "ingest_total_count": None,
+            "current_archive_ingest_processed_count": 0,
+            "current_archive_ingest_total_count": None,
+            "current_ingest_symbol": None,
+            "current_ingest_path": None,
+            "current_ingest_status": None,
             "error_message": None,
         }
         return FakeJob(self.active)
@@ -66,6 +74,14 @@ class FakeSyncManager:
             "downloaded_count": 0,
             "ingested_count": 0,
             "failed_count": 0,
+            "planned_download_count": 1,
+            "ingest_processed_count": 0,
+            "ingest_total_count": 1,
+            "current_archive_ingest_processed_count": 0,
+            "current_archive_ingest_total_count": 1,
+            "current_ingest_symbol": None,
+            "current_ingest_path": None,
+            "current_ingest_status": None,
             "error_message": None,
         }
         return FakeJob(self.active)
@@ -134,6 +150,14 @@ def test_admin_page_and_settings_roundtrip(tmp_path):
     assert 'href="/admin/calendar"' in page.text
     assert 'id="baiduAuthStatus"' in page.text
     assert 'id="authorizeBaiduBtn"' in page.text
+    assert 'id="fullSyncBtn"' in page.text
+    assert 'id="ingestDetail"' in page.text
+    assert "current_ingest_symbol" in page.text
+    assert "ingest_processed_count" in page.text
+    assert "current_archive_ingest_processed_count" in page.text
+    assert "当前归档" in page.text
+    assert "同步指定股票" in page.text
+    assert "填入全市场股票" in page.text
     assert "CALENDAR_COLOR_HAS_DATA" not in page.text
 
     calendar_page = client.get("/admin/calendar")
@@ -183,6 +207,40 @@ def test_admin_page_and_settings_roundtrip(tmp_path):
     assert saved.status_code == 200
     assert saved.json()["sync_defaults"]["symbols"] == ["sh600000", "sz000001"]
     assert client.get("/admin/api/settings").json()["sync_defaults"]["timeframe"] == "5m"
+
+
+def test_admin_symbols_api_lists_saved_listed_symbols(tmp_path):
+    settings = Settings(data_root=tmp_path / "data")
+    app = create_app(settings)
+    metadata = SyncMetadata(settings.metadata_db)
+    metadata.initialize()
+    metadata.upsert_symbol(
+        symbol="sh600000",
+        code="600000",
+        name="浦发银行",
+        exchange="sh",
+        listed_at=dt.date(1999, 11, 10),
+        status="listed",
+        source="baostock",
+    )
+    metadata.upsert_symbol(
+        symbol="sz000003",
+        code="000003",
+        name="退市股票",
+        exchange="sz",
+        listed_at=dt.date(1991, 1, 1),
+        delisted_at=dt.date(2002, 6, 14),
+        status="delisted",
+        source="baostock",
+    )
+
+    response = TestClient(app).get("/admin/api/symbols")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["count"] == 1
+    assert payload["symbols"][0]["symbol"] == "sh600000"
+    assert payload["symbols"][0]["listed_at"] == "1999-11-10"
 
 
 def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):

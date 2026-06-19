@@ -4,8 +4,10 @@ import datetime as dt
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from stock_data_service.market.calendar import SimpleTradingCalendar, TradingCalendar
+from stock_data_service.market.calendar import SSETradingCalendar, TradingCalendar
 from stock_data_service.market.timeframe import Timeframe
+
+BAIDU_STOCKK_TIMEFRAMES = frozenset({Timeframe.M1, Timeframe.M5, Timeframe.M15, Timeframe.M30, Timeframe.H1})
 
 
 @dataclass(frozen=True)
@@ -32,11 +34,13 @@ class RemotePathStrategy(ABC):
 @dataclass
 class BaiduStockKPathStrategy(RemotePathStrategy):
     data_dir: str = "/A股_分时数据"
-    calendar: TradingCalendar = field(default_factory=SimpleTradingCalendar)
+    calendar: TradingCalendar = field(default_factory=SSETradingCalendar)
     supported_start: dt.date = dt.date(2000, 6, 9)
     supported_end: dt.date | None = None
 
     def candidates(self, timeframe: Timeframe, trade_date: dt.date) -> list[RemoteFileCandidate]:
+        if timeframe not in BAIDU_STOCKK_TIMEFRAMES:
+            raise ValueError(f"unsupported Baidu StockK timeframe: {timeframe.value}")
         folder = self._folder(timeframe)
         suffix = self._suffix(timeframe)
         ymd = trade_date.strftime("%Y%m%d")

@@ -4,6 +4,8 @@ import datetime as dt
 import io
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
+from collections.abc import Iterator
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -61,6 +63,48 @@ class ZipBarParser:
 
         return ParseResult(parsed, "ok")
 
+    def iter_parse_archive(
+        self,
+        zip_path: str | Path,
+        symbols: list[str],
+        *,
+        start: dt.datetime | None = None,
+        end: dt.datetime | None = None,
+        source_path: str | None = None,
+        source: str = "baidu_netdisk",
+    ) -> Iterator[tuple[str, ParseResult]]:
+        normalized_symbols = [normalize_symbol(symbol) for symbol in symbols]
+        try:
+            with zipfile.ZipFile(zip_path, "r") as archive:
+                member_index = self._build_member_index(archive.namelist())
+                for normalized in normalized_symbols:
+                    member = member_index.get(normalized)
+                    if member is None:
+                        yield normalized, ParseResult(_empty(), "symbol_missing", f"{normalized} CSV not found")
+                        continue
+                    try:
+                        content = archive.read(member)
+                        parsed = self._parse_csv(
+                            content,
+                            normalized,
+                            start=_to_shanghai_naive(start),
+                            end=_to_shanghai_naive(end),
+                            source_path=source_path,
+                            source=source,
+                        )
+                    except zipfile.BadZipFile as exc:
+                        yield normalized, ParseResult(_empty(), "corrupted_zip", str(exc))
+                    except Exception as exc:
+                        yield normalized, ParseResult(_empty(), "parse_failed", str(exc))
+                    else:
+                        yield normalized, ParseResult(parsed, "ok")
+        except zipfile.BadZipFile as exc:
+            for normalized in normalized_symbols:
+                yield normalized, ParseResult(_empty(), "corrupted_zip", str(exc))
+        except Exception as exc:
+            for normalized in normalized_symbols:
+                yield normalized, ParseResult(_empty(), "parse_failed", str(exc))
+
     @staticmethod
     def _find_member(names: list[str], normalized: str, code: str) -> str | None:
         candidates = {
@@ -69,11 +113,21 @@ class ZipBarParser:
             f"{code}.csv",
             f"{code}.{normalized[:2].upper()}.csv",
         }
+        lowered_candidates = {item.lower() for item in candidates}
         for name in names:
             base = name.rsplit("/", 1)[-1]
-            if base in candidates or base.lower() in {item.lower() for item in candidates}:
+            if base in candidates or base.lower() in lowered_candidates or _is_symbol_archive_member(base, normalized, code):
                 return name
         return None
+
+    @staticmethod
+    def _build_member_index(names: list[str]) -> dict[str, str]:
+        index: dict[str, str] = {}
+        for name in names:
+            base = name.rsplit("/", 1)[-1]
+            for symbol in _symbols_for_member(base):
+                index.setdefault(symbol, name)
+        return index
 
     @staticmethod
     def _parse_csv(
@@ -163,6 +217,34 @@ def _read_csv_with_fallback(content: bytes) -> pd.DataFrame:
     if last_error is not None:
         raise last_error
     raise ValueError("unable to read CSV")
+
+
+def _is_symbol_archive_member(base_name: str, normalized: str, code: str) -> bool:
+    lower = base_name.lower()
+    if not lower.endswith(".csv"):
+        return False
+    stem = lower[:-4]
+    prefixes = (normalized.lower(), code.lower())
+    return any(stem.startswith(prefix + separator) for prefix in prefixes for separator in ("_", "-", "."))
+
+
+def _symbols_for_member(base_name: str) -> set[str]:
+    lower = base_name.lower()
+    if not lower.endswith(".csv"):
+        return set()
+    stem = lower[:-4]
+    candidates = {stem}
+    for separator in ("_", "-", "."):
+        if separator in stem:
+            candidates.add(stem.split(separator, 1)[0])
+
+    symbols: set[str] = set()
+    for candidate in candidates:
+        try:
+            symbols.add(normalize_symbol(candidate))
+        except ValueError:
+            continue
+    return symbols
 
 
 def _normalize_time(value: object) -> str:

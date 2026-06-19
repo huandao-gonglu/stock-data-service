@@ -1,5 +1,6 @@
 import datetime as dt
 
+from stock_data_service.market.security_master import SecurityListing
 from stock_data_service.storage.sync_metadata import SyncMetadata
 
 
@@ -77,6 +78,28 @@ def test_records_parse_failure_statuses_distinctly(metadata):
     ]
 
 
+def test_upserts_symbol_listing_metadata(metadata):
+    count = metadata.upsert_symbols(
+        [
+            SecurityListing(
+                symbol="sh600000",
+                code="600000",
+                name="浦发银行",
+                exchange="sh",
+                listed_at=dt.date(1999, 11, 10),
+                delisted_at=None,
+                status="listed",
+                source="baostock",
+            )
+        ]
+    )
+
+    assert count == 1
+    assert metadata.fetchone(
+        "SELECT symbol, code, name, exchange, listed_at, delisted_at, status, source FROM symbols"
+    ) == ("sh600000", "600000", "浦发银行", "sh", dt.date(1999, 11, 10), None, "listed", "baostock")
+
+
 def test_coverage_and_sync_job_counters(metadata):
     metadata.update_coverage_daily(
         symbol="sh600000",
@@ -93,3 +116,53 @@ def test_coverage_and_sync_job_counters(metadata):
     metadata.complete_sync_job(job, scanned_count=2, downloaded_count=2, ingested_count=1, failed_count=1)
     assert metadata.fetchone("SELECT row_count, quality_flag FROM coverage_daily")[0:2] == (1, "partial")
     assert metadata.fetchone("SELECT scanned_count, ingested_count FROM sync_jobs WHERE id = ?", [job]) == (2, 1)
+
+
+def test_marks_unfinished_sync_jobs_stopped(metadata):
+    running_job = metadata.create_sync_job("s")
+    completed_job = metadata.create_sync_job("s")
+    metadata.complete_sync_job(completed_job, status="completed")
+
+    assert metadata.mark_unfinished_sync_jobs_stopped(error_message="recovered") == 1
+
+    assert metadata.fetchone("SELECT status, error_message FROM sync_jobs WHERE id = ?", [running_job]) == (
+        "stopped",
+        "recovered",
+    )
+    assert metadata.fetchone("SELECT status, error_message FROM sync_jobs WHERE id = ?", [completed_job]) == (
+        "completed",
+        None,
+    )
+    assert metadata.mark_unfinished_sync_jobs_stopped(error_message="again") == 0
+
+
+def test_dates_requiring_sync_skips_only_dates_complete_for_all_symbols(metadata):
+    dates = [dt.date(2024, 12, 20), dt.date(2024, 12, 23), dt.date(2024, 12, 24)]
+    for symbol in ["sh600000", "sz000001"]:
+        metadata.update_coverage_daily(
+            symbol=symbol,
+            timeframe="1m",
+            trade_date=dt.date(2024, 12, 20),
+            start_ts=dt.datetime(2024, 12, 20, 9, 30),
+            end_ts=dt.datetime(2024, 12, 20, 15, 0),
+            row_count=240,
+            expected_row_count=240,
+            is_complete=True,
+            quality_flag="ok",
+        )
+    metadata.update_coverage_daily(
+        symbol="sh600000",
+        timeframe="1m",
+        trade_date=dt.date(2024, 12, 23),
+        start_ts=dt.datetime(2024, 12, 23, 9, 30),
+        end_ts=dt.datetime(2024, 12, 23, 10, 0),
+        row_count=30,
+        expected_row_count=240,
+        is_complete=False,
+        quality_flag="partial",
+    )
+
+    assert metadata.dates_requiring_sync(symbols=["sh600000", "sz000001"], timeframe="1m", trade_dates=dates) == [
+        dt.date(2024, 12, 23),
+        dt.date(2024, 12, 24),
+    ]

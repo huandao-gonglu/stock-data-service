@@ -10,12 +10,21 @@ from stock_data_service.auth.token_manager import TokenManager
 from stock_data_service.baidu.pan_client import BaiduPanClient
 from stock_data_service.config import Settings, ensure_runtime_dirs
 from stock_data_service.logging_config import configure_logging
+from stock_data_service.market.security_master import BaostockSecurityMasterClient
 from stock_data_service.market.timeframe import Timeframe
 from stock_data_service.storage.sync_metadata import SyncMetadata
 from stock_data_service.sync.downloader import BaiduDownloader
 from stock_data_service.sync.job_runner import BaiduSyncJobRunner, LocalSyncJobRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _symbol_log_summary(symbols: list[str]) -> dict:
+    return {
+        "count": len(symbols),
+        "sample": symbols[:20],
+        "truncated": len(symbols) > 20,
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -48,6 +57,11 @@ def main(argv: list[str] | None = None) -> None:
     sync_baidu.add_argument("--end", required=True)
     sync_baidu.add_argument("--symbol", action="append", required=True)
 
+    refresh_symbols = subcommands.add_parser("refresh-symbols")
+    refresh_symbols.add_argument("--data-root", default="./data")
+    refresh_symbols.add_argument("--meta-db")
+    refresh_symbols.add_argument("--provider", choices=["baostock"], default="baostock")
+
     args = parser.parse_args(argv)
     if args.command == "ingest-local":
         _ingest_local(args)
@@ -55,6 +69,8 @@ def main(argv: list[str] | None = None) -> None:
         _download_baidu(args)
     elif args.command == "sync-baidu":
         _sync_baidu(args)
+    elif args.command == "refresh-symbols":
+        _refresh_symbols(args)
 
 
 def _ingest_local(args: argparse.Namespace) -> None:
@@ -68,7 +84,7 @@ def _ingest_local(args: argparse.Namespace) -> None:
         args.timeframe,
         args.start,
         args.end,
-        args.symbol,
+        _symbol_log_summary(args.symbol),
     )
     metadata = SyncMetadata(settings.metadata_db)
     runner = LocalSyncJobRunner(
@@ -133,7 +149,7 @@ def _sync_baidu(args: argparse.Namespace) -> None:
         args.timeframe,
         args.start,
         args.end,
-        args.symbol,
+        _symbol_log_summary(args.symbol),
     )
     metadata = SyncMetadata(settings.metadata_db)
     runner = BaiduSyncJobRunner(
@@ -162,6 +178,21 @@ def _sync_baidu(args: argparse.Namespace) -> None:
         result.ingested_count,
         result.failed_count,
     )
+
+
+def _refresh_symbols(args: argparse.Namespace) -> None:
+    settings = _settings_for_command(args.data_root, args.meta_db)
+    ensure_runtime_dirs(settings)
+    configure_logging(settings)
+    metadata = SyncMetadata(settings.metadata_db)
+    metadata.initialize()
+    if args.provider == "baostock":
+        listings = BaostockSecurityMasterClient().fetch_all()
+    else:
+        raise ValueError(f"unsupported provider: {args.provider}")
+    count = metadata.upsert_symbols(listings)
+    print(f"refreshed symbols={count} provider={args.provider}")
+    logger.info("cli refresh-symbols finished provider=%s count=%s", args.provider, count)
 
 
 def _baidu_client(cache_dir: Path) -> BaiduPanClient:

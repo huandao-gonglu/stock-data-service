@@ -5,7 +5,7 @@ import logging
 import threading
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from stock_data_service.auth.token_manager import TokenManager
 from stock_data_service.baidu.pan_client import BaiduPanClient
@@ -25,6 +25,36 @@ def _now() -> dt.datetime:
 
 def _iso(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
+
+
+def _request_payload(request: ManagedSyncRequest | ManagedFileSyncRequest) -> dict:
+    payload = asdict(request)
+    symbols = payload.get("symbols")
+    if isinstance(symbols, list) and len(symbols) > 100:
+        payload["symbol_count"] = len(symbols)
+        payload["symbols"] = symbols[:20]
+        payload["symbols_truncated"] = True
+    return payload
+
+
+def _request_log_summary(request: ManagedSyncRequest | ManagedFileSyncRequest) -> dict:
+    payload = asdict(request)
+    symbols = payload.pop("symbols", [])
+    payload["symbol_count"] = len(symbols) if isinstance(symbols, list) else 0
+    return payload
 
 
 @dataclass(frozen=True)
@@ -65,6 +95,14 @@ class ManagedSyncJob:
     downloaded_count: int = 0
     ingested_count: int = 0
     failed_count: int = 0
+    planned_download_count: int | None = None
+    ingest_processed_count: int = 0
+    ingest_total_count: int | None = None
+    current_archive_ingest_processed_count: int = 0
+    current_archive_ingest_total_count: int | None = None
+    current_ingest_symbol: str | None = None
+    current_ingest_path: str | None = None
+    current_ingest_status: str | None = None
     error_message: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -72,7 +110,7 @@ class ManagedSyncJob:
         return {
             "id": self.id,
             "kind": self.kind,
-            "request": asdict(self.request),
+            "request": _request_payload(self.request),
             "status": self.status,
             "stage": self.stage,
             "progress_percent": self.progress_percent,
@@ -87,6 +125,14 @@ class ManagedSyncJob:
             "downloaded_count": self.downloaded_count,
             "ingested_count": self.ingested_count,
             "failed_count": self.failed_count,
+            "planned_download_count": self.planned_download_count,
+            "ingest_processed_count": self.ingest_processed_count,
+            "ingest_total_count": self.ingest_total_count,
+            "current_archive_ingest_processed_count": self.current_archive_ingest_processed_count,
+            "current_archive_ingest_total_count": self.current_archive_ingest_total_count,
+            "current_ingest_symbol": self.current_ingest_symbol,
+            "current_ingest_path": self.current_ingest_path,
+            "current_ingest_status": self.current_ingest_status,
             "error_message": self.error_message,
         }
 
@@ -151,7 +197,7 @@ class SyncJobManager:
             job.started_at = _now()
             job.stage = "开始同步"
             job.progress_percent = 5
-        logger.info("managed baidu sync started job_id=%s request=%s", job.id, job.request)
+        logger.info("managed baidu sync started job_id=%s request=%s", job.id, _request_log_summary(job.request))
 
         try:
             result = self._build_baidu_runner(job.request).run(
@@ -160,7 +206,9 @@ class SyncJobManager:
                 end=dt.date.fromisoformat(job.request.end),
                 symbols=job.request.symbols,
                 cancel_event=job.cancel_event,
-                progress_callback=lambda stage, percent, download: self._update_progress(job_id, stage, percent, download),
+                progress_callback=lambda stage, percent, download, counts=None: self._update_progress(
+                    job_id, stage, percent, download, counts
+                ),
             )
         except SyncCancelled as exc:
             with self._lock:
@@ -169,6 +217,7 @@ class SyncJobManager:
                 job.error_message = str(exc)
                 job.stage = "已停止"
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu sync stopped job_id=%s", job.id)
         except Exception as exc:
@@ -179,6 +228,7 @@ class SyncJobManager:
                 job.stage = "同步失败"
                 job.progress_percent = 100
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.exception("managed baidu sync failed job_id=%s", job.id)
         else:
@@ -192,6 +242,7 @@ class SyncJobManager:
                 job.stage = "同步完成"
                 job.progress_percent = 100
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu sync finished job_id=%s status=%s", job.id, job.status)
 
@@ -205,7 +256,7 @@ class SyncJobManager:
             job.started_at = _now()
             job.stage = "开始同步文件"
             job.progress_percent = 5
-        logger.info("managed baidu file sync started job_id=%s request=%s", job.id, request)
+        logger.info("managed baidu file sync started job_id=%s request=%s", job.id, _request_log_summary(request))
 
         try:
             result = self._build_baidu_runner(request).run_file(
@@ -215,7 +266,9 @@ class SyncJobManager:
                 end=dt.date.fromisoformat(request.end),
                 symbols=request.symbols,
                 cancel_event=job.cancel_event,
-                progress_callback=lambda stage, percent, download: self._update_progress(job_id, stage, percent, download),
+                progress_callback=lambda stage, percent, download, counts=None: self._update_progress(
+                    job_id, stage, percent, download, counts
+                ),
             )
         except SyncCancelled as exc:
             with self._lock:
@@ -224,6 +277,7 @@ class SyncJobManager:
                 job.error_message = str(exc)
                 job.stage = "已停止"
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu file sync stopped job_id=%s", job.id)
         except Exception as exc:
@@ -234,6 +288,7 @@ class SyncJobManager:
                 job.stage = "同步失败"
                 job.progress_percent = 100
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.exception("managed baidu file sync failed job_id=%s", job.id)
         else:
@@ -247,16 +302,60 @@ class SyncJobManager:
                 job.stage = "同步完成"
                 job.progress_percent = 100
                 self._clear_download(job)
+                self._clear_ingest(job)
                 self._active_job_id = None
             logger.info("managed baidu file sync finished job_id=%s status=%s", job.id, job.status)
 
-    def _update_progress(self, job_id: str, stage: str, percent: int, download: dict | None = None) -> None:
+    def _update_progress(
+        self,
+        job_id: str,
+        stage: str,
+        percent: int,
+        download: dict | None = None,
+        counts: dict | None = None,
+    ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if not job or job.status not in {"queued", "running", "stopping"}:
                 return
-            job.stage = stage
-            job.progress_percent = max(0, min(percent, 100))
+            download_only_update = download is not None and counts is None
+            preserve_ingest_stage = download_only_update and (job.downloaded_count > 0 or job.ingested_count > 0)
+            if job.status != "stopping" and not preserve_ingest_stage:
+                job.stage = stage
+            next_percent = max(0, min(percent, 100))
+            if preserve_ingest_stage:
+                job.progress_percent = max(job.progress_percent, next_percent)
+            else:
+                job.progress_percent = next_percent
+            if counts is not None:
+                if "scanned_count" in counts:
+                    job.scanned_count = int(counts.get("scanned_count") or 0)
+                if "downloaded_count" in counts:
+                    job.downloaded_count = int(counts.get("downloaded_count") or 0)
+                if "ingested_count" in counts:
+                    job.ingested_count = int(counts.get("ingested_count") or 0)
+                if "failed_count" in counts:
+                    job.failed_count = int(counts.get("failed_count") or 0)
+                if "planned_download_count" in counts:
+                    job.planned_download_count = _optional_int(counts.get("planned_download_count"))
+                if "ingest_processed_count" in counts:
+                    job.ingest_processed_count = int(counts.get("ingest_processed_count") or 0)
+                if "ingest_total_count" in counts:
+                    job.ingest_total_count = _optional_int(counts.get("ingest_total_count"))
+                if "current_archive_ingest_processed_count" in counts:
+                    job.current_archive_ingest_processed_count = int(
+                        counts.get("current_archive_ingest_processed_count") or 0
+                    )
+                if "current_archive_ingest_total_count" in counts:
+                    job.current_archive_ingest_total_count = _optional_int(
+                        counts.get("current_archive_ingest_total_count")
+                    )
+                if "current_ingest_symbol" in counts:
+                    job.current_ingest_symbol = _optional_text(counts.get("current_ingest_symbol"))
+                if "current_ingest_path" in counts:
+                    job.current_ingest_path = _optional_text(counts.get("current_ingest_path"))
+                if "current_ingest_status" in counts:
+                    job.current_ingest_status = _optional_text(counts.get("current_ingest_status"))
             if download is not None:
                 job.download_speed_bytes_per_sec = float(download.get("speed_bytes_per_sec") or 0)
                 job.downloaded_bytes = int(download.get("bytes_downloaded") or 0)
@@ -272,6 +371,12 @@ class SyncJobManager:
         job.downloaded_bytes = 0
         job.download_total_bytes = None
         job.current_download_path = None
+
+    @staticmethod
+    def _clear_ingest(job: ManagedSyncJob) -> None:
+        job.current_ingest_symbol = None
+        job.current_ingest_path = None
+        job.current_ingest_status = None
 
     def _build_baidu_runner(self, request: ManagedSyncRequest | ManagedFileSyncRequest) -> BaiduSyncJobRunner:
         token_manager = TokenManager(

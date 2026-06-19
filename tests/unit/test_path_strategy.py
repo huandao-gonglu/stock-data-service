@@ -1,5 +1,7 @@
 import datetime as dt
 
+import pytest
+
 from stock_data_service.market.calendar import SimpleTradingCalendar
 from stock_data_service.market.path_strategy import BaiduStockKPathStrategy, RemotePathStrategy
 from stock_data_service.market.timeframe import Timeframe
@@ -30,6 +32,11 @@ def test_baidu_stockk_strategy_generates_timeframe_folders_and_suffixes():
         assert strategy.candidates(timeframe, day)[0].remote_path == path
 
 
+def test_baidu_stockk_strategy_rejects_daily_timeframe():
+    with pytest.raises(ValueError, match="unsupported Baidu StockK timeframe"):
+        BaiduStockKPathStrategy().candidates(Timeframe.D1, dt.date(2024, 12, 20))
+
+
 def test_range_candidates_use_trading_days_and_clamp_supported_range():
     strategy = BaiduStockKPathStrategy(
         calendar=SimpleTradingCalendar(),
@@ -39,3 +46,14 @@ def test_range_candidates_use_trading_days_and_clamp_supported_range():
     candidates = strategy.candidates_for_range(Timeframe.M1, dt.date(2024, 12, 19), dt.date(2024, 12, 24))
     trade_dates = {item.trade_date for item in candidates}
     assert trade_dates == {dt.date(2024, 12, 20), dt.date(2024, 12, 23)}
+
+
+def test_default_strategy_uses_sse_calendar_holidays():
+    strategy = BaiduStockKPathStrategy(
+        supported_start=dt.date(2007, 10, 1),
+        supported_end=dt.date(2007, 10, 8),
+    )
+    candidates = strategy.candidates_for_range(Timeframe.M1, dt.date(2007, 10, 1), dt.date(2007, 10, 8))
+    trade_dates = {item.trade_date for item in candidates}
+    assert dt.date(2007, 10, 1) not in trade_dates
+    assert trade_dates == {dt.date(2007, 10, 8)}

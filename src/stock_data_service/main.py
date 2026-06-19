@@ -18,7 +18,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     ensure_runtime_dirs(settings)
     log_path = configure_logging(settings)
-    SyncMetadata(settings.metadata_db).initialize()
+    metadata = SyncMetadata(settings.metadata_db)
+    metadata.initialize()
+    recovered_jobs = metadata.mark_unfinished_sync_jobs_stopped()
+    if recovered_jobs:
+        logger.warning("recovered stale unfinished sync jobs count=%s", recovered_jobs)
 
     app = FastAPI(title="Stock Data Service", version="0.1.0")
     app.state.settings = settings

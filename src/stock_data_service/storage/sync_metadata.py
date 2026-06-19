@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
 import duckdb
+
+_DB_LOCKS: dict[Path, threading.RLock] = {}
+_DB_LOCKS_GUARD = threading.Lock()
 
 
 class SyncMetadata:
@@ -14,7 +19,20 @@ class SyncMetadata:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def connect(self) -> duckdb.DuckDBPyConnection:
-        return duckdb.connect(str(self.db_path))
+        lock = _db_lock(self.db_path)
+        lock.acquire()
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                return _LockedConnection(duckdb.connect(str(self.db_path)), lock)
+            except duckdb.IOException:
+                if time.monotonic() >= deadline:
+                    lock.release()
+                    raise
+                time.sleep(0.1)
+            except Exception:
+                lock.release()
+                raise
 
     def initialize(self) -> None:
         with self.connect() as con:
@@ -284,6 +302,72 @@ class SyncMetadata:
                 ],
             )
 
+    def dates_requiring_sync(
+        self,
+        *,
+        symbols: list[str],
+        timeframe: str,
+        trade_dates: list[dt.date],
+    ) -> list[dt.date]:
+        unique_symbols = sorted(set(symbols))
+        unique_dates = sorted(set(trade_dates))
+        if not unique_symbols or not unique_dates:
+            return []
+
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT symbol, trade_date, is_complete, quality_flag
+                FROM coverage_daily
+                WHERE symbol IN (SELECT * FROM UNNEST(?))
+                  AND timeframe = ?
+                  AND trade_date >= ?
+                  AND trade_date <= ?
+                """,
+                [unique_symbols, timeframe, unique_dates[0], unique_dates[-1]],
+            ).fetchall()
+
+        complete = {
+            (row[0], row[1])
+            for row in rows
+            if bool(row[2]) and row[3] == "ok"
+        }
+        return [
+            trade_date
+            for trade_date in unique_dates
+            if any((symbol, trade_date) not in complete for symbol in unique_symbols)
+        ]
+
+    def committed_ingest_paths(
+        self,
+        *,
+        source_id: str,
+        timeframe: str,
+        symbols: list[str],
+        remote_paths: list[str],
+    ) -> set[str]:
+        unique_symbols = sorted(set(symbols))
+        unique_paths = sorted(set(remote_paths))
+        if not unique_symbols or not unique_paths:
+            return set()
+
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                SELECT remote_path, COUNT(DISTINCT symbol) AS symbol_count
+                FROM file_ingests
+                WHERE source_id = ?
+                  AND timeframe = ?
+                  AND status = 'committed'
+                  AND symbol IN (SELECT * FROM UNNEST(?))
+                  AND remote_path IN (SELECT * FROM UNNEST(?))
+                GROUP BY remote_path
+                """,
+                [source_id, timeframe, unique_symbols, unique_paths],
+            ).fetchall()
+        required_symbol_count = len(unique_symbols)
+        return {row[0] for row in rows if int(row[1]) >= required_symbol_count}
+
     def upsert_symbol(
         self,
         *,
@@ -291,17 +375,51 @@ class SyncMetadata:
         code: str,
         name: str | None = None,
         exchange: str | None = None,
+        listed_at: dt.date | None = None,
+        delisted_at: dt.date | None = None,
+        status: str | None = None,
+        source: str | None = None,
     ) -> None:
         with self.connect() as con:
             con.execute("DELETE FROM symbols WHERE symbol = ?", [symbol])
             con.execute(
                 """
                 INSERT INTO symbols
-                (symbol, code, name, exchange, listed_at, delisted_at, updated_at)
-                VALUES (?, ?, ?, ?, NULL, NULL, ?)
+                (symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [symbol, code, name, exchange, _now()],
+                [symbol, code, name, exchange, listed_at, delisted_at, status, source, _now()],
             )
+
+    def upsert_symbols(self, listings: list[Any]) -> int:
+        rows = [
+            (
+                listing.symbol,
+                listing.code,
+                listing.name,
+                listing.exchange,
+                listing.listed_at,
+                listing.delisted_at,
+                listing.status,
+                listing.source,
+                _now(),
+            )
+            for listing in listings
+        ]
+        if not rows:
+            return 0
+        symbols = [row[0] for row in rows]
+        with self.connect() as con:
+            con.execute("DELETE FROM symbols WHERE symbol IN (SELECT * FROM UNNEST(?))", [symbols])
+            con.executemany(
+                """
+                INSERT INTO symbols
+                (symbol, code, name, exchange, listed_at, delisted_at, status, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return len(rows)
 
     def create_sync_job(self, source_id: str) -> str:
         job_id = f"sync-{uuid.uuid4()}"
@@ -348,6 +466,31 @@ class SyncMetadata:
                 ],
             )
 
+    def mark_unfinished_sync_jobs_stopped(
+        self,
+        *,
+        error_message: str = "stale running job recovered after process restart",
+    ) -> int:
+        with self.connect() as con:
+            count = con.execute(
+                """
+                SELECT COUNT(*)
+                FROM sync_jobs
+                WHERE status IN ('queued', 'running', 'stopping') AND finished_at IS NULL
+                """
+            ).fetchone()[0]
+            if int(count) == 0:
+                return 0
+            con.execute(
+                """
+                UPDATE sync_jobs
+                SET status = 'stopped', finished_at = ?, error_message = COALESCE(error_message, ?)
+                WHERE status IN ('queued', 'running', 'stopping') AND finished_at IS NULL
+                """,
+                [_now(), error_message],
+            )
+            return int(count)
+
     def fetchone(self, sql: str, params: list[Any] | None = None) -> tuple[Any, ...] | None:
         with self.connect() as con:
             return con.execute(sql, params or []).fetchone()
@@ -359,6 +502,43 @@ class SyncMetadata:
 
 def _now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+
+
+def _db_lock(path: Path) -> threading.RLock:
+    key = path.resolve()
+    with _DB_LOCKS_GUARD:
+        return _DB_LOCKS.setdefault(key, threading.RLock())
+
+
+class _LockedConnection:
+    def __init__(self, connection: duckdb.DuckDBPyConnection, lock: threading.RLock):
+        self._connection = connection
+        self._lock = lock
+        self._released = False
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self._connection
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            return self._connection.__exit__(exc_type, exc, tb)
+        finally:
+            self._release()
+
+    def close(self) -> None:
+        try:
+            self._connection.close()
+        finally:
+            self._release()
+
+    def __getattr__(self, name: str):
+        return getattr(self._connection, name)
+
+    def _release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._lock.release()
 
 
 _DDL = [
@@ -447,7 +627,11 @@ _DDL = [
         exchange VARCHAR,
         listed_at DATE,
         delisted_at DATE,
+        status VARCHAR,
+        source VARCHAR,
         updated_at TIMESTAMP NOT NULL
     )
     """,
+    "ALTER TABLE symbols ADD COLUMN IF NOT EXISTS status VARCHAR",
+    "ALTER TABLE symbols ADD COLUMN IF NOT EXISTS source VARCHAR",
 ]

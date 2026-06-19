@@ -111,7 +111,12 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
             saved = AdminSettingsStore(settings).save(payload)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        logger.info("admin settings saved source_id=%s timeframe=%s symbols=%s", saved.source_id, saved.timeframe, saved.symbols)
+        logger.info(
+            "admin settings saved source_id=%s timeframe=%s symbol_count=%s",
+            saved.source_id,
+            saved.timeframe,
+            len(saved.symbols),
+        )
         return {"sync_defaults": asdict(saved)}
 
     @router.get("/admin/api/sync/status")
@@ -119,6 +124,30 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
         return {
             "manager": _sync_manager(request, settings).status(),
             "recent_jobs": _recent_sync_jobs(settings),
+        }
+
+    @router.get("/admin/api/symbols")
+    def list_symbols(
+        status: str = Query("listed"),
+        limit: int = Query(10000, ge=1, le=100000),
+    ) -> dict:
+        rows = _symbol_rows(settings, status=status, limit=limit)
+        return {
+            "status": status,
+            "count": len(rows),
+            "symbols": [
+                {
+                    "symbol": row[0],
+                    "code": row[1],
+                    "name": row[2],
+                    "exchange": row[3],
+                    "listed_at": _iso(row[4]),
+                    "delisted_at": _iso(row[5]),
+                    "status": row[6],
+                    "source": row[7],
+                }
+                for row in rows
+            ],
         }
 
     @router.get("/admin/api/coverage/calendar")
@@ -632,6 +661,21 @@ def _recent_sync_jobs(settings: Settings) -> list[dict]:
     ]
 
 
+def _symbol_rows(settings: Settings, *, status: str, limit: int) -> list:
+    metadata = SyncMetadata(settings.metadata_db)
+    metadata.initialize()
+    return metadata.fetchall(
+        """
+        SELECT symbol, code, name, exchange, listed_at, delisted_at, status, source
+        FROM symbols
+        WHERE (? = 'all' OR status = ?)
+        ORDER BY exchange, code
+        LIMIT ?
+        """,
+        [status, status, limit],
+    )
+
+
 def _iso(value) -> str | None:
     return value.isoformat() if hasattr(value, "isoformat") else value
 
@@ -909,7 +953,7 @@ _ADMIN_HTML = """<!doctype html>
       </label>
       <button id="refreshBtn" type="button">↻ 刷新</button>
       <a class="nav-button" href="/admin/calendar">数据日历</a>
-      <button id="startBtn" class="primary" type="button">▶ 同步</button>
+      <button id="startBtn" class="primary" type="button">▶ 同步指定股票</button>
       <button id="stopBtn" class="danger" type="button">■ 停止</button>
     </form>
     <div class="grid">
@@ -927,7 +971,6 @@ _ADMIN_HTML = """<!doctype html>
                 <option value="15m">15m</option>
                 <option value="30m">30m</option>
                 <option value="60m">60m</option>
-                <option value="1d">1d</option>
               </select>
             </label>
             <label>开始日期
@@ -936,7 +979,11 @@ _ADMIN_HTML = """<!doctype html>
             <label>结束日期
               <input id="endDate" type="date">
             </label>
-            <label class="span-2">股票代码
+            <label class="span-2">
+              <span style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
+                <span>股票代码</span>
+                <button id="fullSyncBtn" type="button">↓ 填入全市场股票</button>
+              </span>
               <textarea id="symbols" spellcheck="false"></textarea>
             </label>
           </div>
@@ -953,6 +1000,7 @@ _ADMIN_HTML = """<!doctype html>
             <span id="activeStatus" class="pill">无运行任务</span>
             <span id="activeCounts" class="pill">0 / 0 / 0</span>
             <span id="downloadSpeed" class="pill">速度 0 B/s</span>
+            <span id="ingestDetail" class="pill">入库 -</span>
           </div>
           <div class="progress-row">
             <div class="progress"><div id="progressBar"></div></div>
@@ -1075,6 +1123,12 @@ _ADMIN_HTML = """<!doctype html>
       const text = String(path || "");
       return text.split("/").filter(Boolean).pop() || "";
     }
+    function countPair(done, total) {
+      const safeDone = Number(done || 0);
+      if (total === null || total === undefined || total === "") return String(safeDone);
+      const safeTotal = Number(total);
+      return Number.isFinite(safeTotal) && safeTotal > 0 ? `${safeDone}/${safeTotal}` : String(safeDone);
+    }
     function formatRate(value) {
       return `${formatBytes(value)}/s`;
     }
@@ -1118,6 +1172,17 @@ _ADMIN_HTML = """<!doctype html>
       if (status === "update_available") return "pill warn";
       if (status === "failed") return "pill bad";
       return "pill";
+    }
+    function ingestStatusLabel(status) {
+      return ({
+        ingesting: "处理中",
+        committed: "已提交",
+        skipped: "跳过",
+        symbol_missing: "未找到",
+        parse_failed: "解析失败",
+        corrupted_zip: "ZIP 损坏",
+        failed: "失败"
+      }[status] || status || "");
     }
     function renderBaiduAuth(settings) {
       const system = settings.system;
@@ -1165,7 +1230,13 @@ _ADMIN_HTML = """<!doctype html>
         activeJobId = active.id;
         $("activeStatus").className = statusClass(active.status);
         $("activeStatus").textContent = active.status;
-        $("activeCounts").textContent = `扫描 ${active.scanned_count} · 下载 ${active.downloaded_count} · 入库 ${active.ingested_count} · 失败 ${active.failed_count}`;
+        const archiveProgress = countPair(active.scanned_count, active.planned_download_count);
+        const ingestProgress = countPair(active.ingest_processed_count, active.ingest_total_count);
+        const currentArchiveIngestProgress = countPair(
+          active.current_archive_ingest_processed_count,
+          active.current_archive_ingest_total_count
+        );
+        $("activeCounts").textContent = `归档 ${archiveProgress} · 下载 ${active.downloaded_count} · 入库 ${active.ingested_count} (${ingestProgress}) · 失败 ${active.failed_count}`;
         const progress = Math.max(0, Math.min(Number(active.progress_percent || 0), 100));
         $("progressBar").style.width = `${progress}%`;
         $("progressText").textContent = `${progress}%`;
@@ -1176,12 +1247,20 @@ _ADMIN_HTML = """<!doctype html>
         const totalText = totalBytes ? ` / ${formatBytes(totalBytes)}` : "";
         const nameText = active.current_download_path ? ` · ${fileName(active.current_download_path)}` : "";
         $("downloadSpeed").textContent = `速度 ${formatRate(speed)}${downloadedBytes ? ` · ${formatBytes(downloadedBytes)}${totalText}` : ""}${nameText}`;
+        const ingestSymbol = active.current_ingest_symbol || "";
+        const ingestPath = active.current_ingest_path ? ` · ${fileName(active.current_ingest_path)}` : "";
+        const ingestStatus = ingestStatusLabel(active.current_ingest_status);
+        const ingestStatusText = ingestStatus ? ` · ${ingestStatus}` : "";
+        $("ingestDetail").textContent = ingestSymbol
+          ? `入库 ${ingestSymbol} · 当前归档 ${currentArchiveIngestProgress} · 总 ${ingestProgress}${ingestStatusText}${ingestPath}`
+          : `入库 当前归档 ${currentArchiveIngestProgress} · 总 ${ingestProgress}`;
       } else {
         activeJobId = null;
         $("activeStatus").className = "pill";
         $("activeStatus").textContent = "无运行任务";
         $("activeCounts").textContent = "扫描 0 · 下载 0 · 入库 0 · 失败 0";
         $("downloadSpeed").textContent = "速度 0 B/s";
+        $("ingestDetail").textContent = "入库 -";
         $("progressBar").style.width = "0%";
         $("progressText").textContent = "0%";
         $("activeStage").textContent = "";
@@ -1191,6 +1270,7 @@ _ADMIN_HTML = """<!doctype html>
       }
       $("stopBtn").disabled = !(active && ["queued", "running", "stopping"].includes(active.status));
       $("startBtn").disabled = !!(active && ["queued", "running", "stopping"].includes(active.status));
+      $("fullSyncBtn").disabled = !!(active && ["queued", "running", "stopping"].includes(active.status));
       const rows = data.recent_jobs || [];
       $("jobsBody").innerHTML = rows.length ? rows.map((job) => `
         <tr>
@@ -1400,6 +1480,18 @@ _ADMIN_HTML = """<!doctype html>
       try {
         await api("/admin/api/sync/start", {method: "POST", body: JSON.stringify(currentPayload())});
         await refreshStatusOnly();
+      } catch (err) {
+        $("settingsMessage").textContent = err.message;
+      }
+    });
+    $("fullSyncBtn").addEventListener("click", async () => {
+      try {
+        $("settingsMessage").textContent = "Loading listed symbols...";
+        const data = await api("/admin/api/symbols?status=listed&limit=100000", {method: "GET"});
+        const symbols = (data.symbols || []).map((item) => item.symbol).filter(Boolean);
+        if (!symbols.length) throw new Error("No listed symbols. Run refresh-symbols first.");
+        $("symbols").value = symbols.join(String.fromCharCode(10));
+        $("settingsMessage").textContent = `Filled ${symbols.length} listed symbols. Click sync selected symbols to start.`;
       } catch (err) {
         $("settingsMessage").textContent = err.message;
       }

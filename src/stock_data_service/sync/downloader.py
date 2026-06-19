@@ -4,9 +4,10 @@ import datetime as dt
 import hashlib
 import logging
 import threading
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Iterator, Literal
 
 from stock_data_service.baidu.pan_client import BaiduFileMeta, BaiduPanClient
 from stock_data_service.market.path_strategy import BaiduStockKPathStrategy, RemoteFileCandidate, RemotePathStrategy
@@ -15,6 +16,7 @@ from stock_data_service.market.timeframe import Timeframe
 BaiduDownloadStatus = Literal["downloaded", "missing", "failed"]
 DownloadProgressCallback = Callable[[dict[str, Any]], None]
 logger = logging.getLogger(__name__)
+CacheValidationStrength = Literal["strong", "weak", "miss"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +36,20 @@ class BaiduDownloadResult:
     @property
     def is_downloaded(self) -> bool:
         return self.status == "downloaded" and self.local_path is not None
+
+
+@dataclass(frozen=True)
+class CacheValidation:
+    matched: bool
+    strength: CacheValidationStrength
+    reason: str
+    local_size: int | None
+    remote_size: int | None
+    remote_md5: str | None
+    remote_md5_usable: bool
+    local_md5: str | None = None
+    md5_check: str = "skipped"
+    zip_check: str = "skipped"
 
 
 class BaiduDownloader:
@@ -66,32 +82,119 @@ class BaiduDownloader:
         cancel_event: threading.Event | None = None,
         progress_callback: DownloadProgressCallback | None = None,
     ) -> list[BaiduDownloadResult]:
-        results: list[BaiduDownloadResult] = []
-        successful_paths: set[str] = set()
         by_date = _group_candidates_by_date(self.path_strategy.candidates_for_range(timeframe, start, end))
+        return list(self._iter_download_by_date(
+            timeframe=timeframe,
+            by_date=by_date,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        ))
+
+    def download_for_trade_dates(
+        self,
+        *,
+        timeframe: Timeframe,
+        trade_dates: list[dt.date],
+        source_preferences: dict[dt.date, list[str]] | None = None,
+        skip_remote_paths: set[str] | None = None,
+        cancel_event: threading.Event | None = None,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> list[BaiduDownloadResult]:
+        return list(
+            self.iter_download_for_trade_dates(
+                timeframe=timeframe,
+                trade_dates=trade_dates,
+                source_preferences=source_preferences,
+                skip_remote_paths=skip_remote_paths,
+                cancel_event=cancel_event,
+                progress_callback=progress_callback,
+            )
+        )
+
+    def iter_download_for_trade_dates(
+        self,
+        *,
+        timeframe: Timeframe,
+        trade_dates: list[dt.date],
+        source_preferences: dict[dt.date, list[str]] | None = None,
+        skip_remote_paths: set[str] | None = None,
+        cancel_event: threading.Event | None = None,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> Iterator[BaiduDownloadResult]:
+        by_date: dict[dt.date, list[RemoteFileCandidate]] = {}
+        source_preferences = source_preferences or {}
+        for trade_date in sorted(set(trade_dates)):
+            candidates = self.path_strategy.candidates(timeframe, trade_date)
+            preference = source_preferences.get(trade_date)
+            if preference:
+                candidates = _sort_by_source_preference(candidates, preference)
+            by_date[trade_date] = candidates
+        yield from self._iter_download_by_date(
+            timeframe=timeframe,
+            by_date=by_date,
+            skip_remote_paths=skip_remote_paths or set(),
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
+
+    def _iter_download_by_date(
+        self,
+        *,
+        timeframe: Timeframe,
+        by_date: dict[dt.date, list[RemoteFileCandidate]],
+        skip_remote_paths: set[str] | None = None,
+        cancel_event: threading.Event | None = None,
+        progress_callback: DownloadProgressCallback | None = None,
+    ) -> Iterator[BaiduDownloadResult]:
+        missing_paths: set[str] = set()
+        successful_paths: set[str] = set()
+        skip_remote_paths = skip_remote_paths or set()
 
         for trade_date, candidates in by_date.items():
             if cancel_event and cancel_event.is_set():
                 break
+            reused_path = next(
+                (
+                    candidate.remote_path
+                    for candidate in candidates
+                    if candidate.remote_path in successful_paths and candidate.remote_path not in skip_remote_paths
+                ),
+                None,
+            )
+            if reused_path is not None:
+                logger.info(
+                    "baidu download reused successful archive trade_date=%s remote_path=%s",
+                    trade_date,
+                    reused_path,
+                )
+                continue
             found_for_date = False
             for candidate in candidates:
                 if cancel_event and cancel_event.is_set():
                     break
-                if candidate.remote_path in successful_paths:
+                if candidate.remote_path in skip_remote_paths:
                     logger.info(
-                        "baidu download reused successful archive trade_date=%s remote_path=%s",
-                        trade_date,
+                        "baidu skipped already-ingested candidate remote_path=%s trade_date=%s source_kind=%s",
                         candidate.remote_path,
+                        trade_date,
+                        candidate.source_kind,
                     )
-                    found_for_date = True
-                    break
+                    continue
+                if candidate.remote_path in missing_paths:
+                    logger.debug("baidu skipped known missing candidate remote_path=%s trade_date=%s", candidate.remote_path, trade_date)
+                    continue
 
-                result = self.download_candidate(timeframe=timeframe, candidate=candidate, progress_callback=progress_callback)
+                result = self.download_candidate(
+                    timeframe=timeframe,
+                    candidate=candidate,
+                    cancel_event=cancel_event,
+                    progress_callback=progress_callback,
+                )
                 if result.status == "missing":
+                    missing_paths.add(candidate.remote_path)
                     logger.debug("baidu candidate missing remote_path=%s trade_date=%s", candidate.remote_path, trade_date)
                     continue
 
-                results.append(result)
                 if result.is_downloaded:
                     logger.info(
                         "baidu candidate downloaded remote_path=%s trade_date=%s source_kind=%s local_path=%s",
@@ -102,28 +205,27 @@ class BaiduDownloader:
                     )
                     successful_paths.add(candidate.remote_path)
                     found_for_date = True
+                    yield result
                     break
+                yield result
 
             if not found_for_date:
-                logger.warning("baidu no candidate found trade_date=%s timeframe=%s", trade_date, timeframe.value)
-                results.append(
-                    BaiduDownloadResult(
-                        remote_path="",
-                        trade_date=trade_date,
-                        timeframe=timeframe,
-                        source_kind="none",
-                        status="missing",
-                        error_message=f"no Baidu zip candidate found for {trade_date.isoformat()}",
-                    )
+                logger.info("baidu no candidate found, skipping trade_date=%s timeframe=%s", trade_date, timeframe.value)
+                yield BaiduDownloadResult(
+                    remote_path="",
+                    trade_date=trade_date,
+                    timeframe=timeframe,
+                    source_kind="none",
+                    status="missing",
+                    error_message=f"no Baidu zip candidate found for {trade_date.isoformat()}",
                 )
-
-        return results
 
     def download_candidate(
         self,
         *,
         timeframe: Timeframe,
         candidate: RemoteFileCandidate,
+        cancel_event: threading.Event | None = None,
         progress_callback: DownloadProgressCallback | None = None,
     ) -> BaiduDownloadResult:
         meta = self.client.get_file_meta_by_path(candidate.remote_path)
@@ -137,27 +239,36 @@ class BaiduDownloader:
             )
 
         local_path = self.cache_dir / candidate.remote_path.lstrip("/")
-        if local_path.exists() and _cache_matches(local_path, meta):
-            logger.info("baidu cache hit remote_path=%s local_path=%s", candidate.remote_path, local_path)
-            return _result_from_meta(
-                meta,
-                timeframe=timeframe,
-                candidate=candidate,
-                status="downloaded",
-                local_path=local_path,
-                content_hash=_sha256(local_path),
-            )
+        cache_validation: CacheValidation | None = None
         if local_path.exists():
-            logger.info("baidu cache stale remote_path=%s local_path=%s", candidate.remote_path, local_path)
-            local_path.unlink()
+            cache_validation = _validate_cache(local_path, meta)
+            _log_cache_validation(candidate.remote_path, local_path, cache_validation)
+            if cache_validation.matched:
+                return _result_from_meta(
+                    meta,
+                    timeframe=timeframe,
+                    candidate=candidate,
+                    status="downloaded",
+                    local_path=local_path,
+                    content_hash=_sha256(local_path),
+                )
+            _discard_partial_download(local_path)
 
         try:
+            download_kwargs: dict[str, Any] = {
+                "progress_callback": _with_candidate_progress(progress_callback, candidate, meta),
+                "cancel_event": cancel_event,
+            }
+            if cache_validation is not None:
+                download_kwargs["use_local_cache"] = False
             saved = self.client.download_by_path(
                 candidate.remote_path,
                 local_path,
-                progress_callback=_with_candidate_progress(progress_callback, candidate, meta),
+                **download_kwargs,
             )
         except Exception as exc:
+            if cancel_event and cancel_event.is_set():
+                raise
             logger.warning("baidu download failed remote_path=%s error=%s", candidate.remote_path, exc)
             return _result_from_meta(
                 meta,
@@ -194,6 +305,15 @@ def _group_candidates_by_date(candidates: list[RemoteFileCandidate]) -> dict[dt.
     for candidate in candidates:
         grouped.setdefault(candidate.trade_date, []).append(candidate)
     return grouped
+
+
+def _sort_by_source_preference(
+    candidates: list[RemoteFileCandidate],
+    source_preference: list[str],
+) -> list[RemoteFileCandidate]:
+    order = {source_kind: index for index, source_kind in enumerate(source_preference)}
+    fallback = len(order)
+    return sorted(candidates, key=lambda candidate: order.get(candidate.source_kind, fallback))
 
 
 def _with_candidate_progress(
@@ -263,9 +383,115 @@ def _md5(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _cache_matches(path: Path, meta: BaiduFileMeta) -> bool:
-    if meta.size is not None and path.stat().st_size != meta.size:
-        return False
-    if meta.md5:
-        return _md5(path).lower() == meta.md5.lower()
-    return True
+def _validate_cache(path: Path, meta: BaiduFileMeta) -> CacheValidation:
+    local_size = path.stat().st_size
+    remote_size = meta.size
+    remote_md5 = meta.md5.strip() if meta.md5 else None
+    remote_md5_usable = _is_standard_md5(remote_md5)
+
+    if remote_size is not None and local_size != remote_size:
+        return CacheValidation(
+            matched=False,
+            strength="miss",
+            reason="size_mismatch",
+            local_size=local_size,
+            remote_size=remote_size,
+            remote_md5=remote_md5,
+            remote_md5_usable=remote_md5_usable,
+        )
+
+    if remote_md5_usable and remote_md5 is not None:
+        local_md5 = _md5(path)
+        if local_md5.lower() == remote_md5.lower():
+            return CacheValidation(
+                matched=True,
+                strength="strong",
+                reason="md5_match",
+                local_size=local_size,
+                remote_size=remote_size,
+                remote_md5=remote_md5,
+                remote_md5_usable=True,
+                local_md5=local_md5,
+                md5_check="passed",
+            )
+        return CacheValidation(
+            matched=False,
+            strength="miss",
+            reason="md5_mismatch",
+            local_size=local_size,
+            remote_size=remote_size,
+            remote_md5=remote_md5,
+            remote_md5_usable=True,
+            local_md5=local_md5,
+            md5_check="failed",
+        )
+
+    if remote_size is None:
+        return CacheValidation(
+            matched=False,
+            strength="miss",
+            reason="no_verifiable_remote_metadata",
+            local_size=local_size,
+            remote_size=remote_size,
+            remote_md5=remote_md5,
+            remote_md5_usable=False,
+        )
+
+    zip_check = "skipped"
+    if path.suffix.lower() == ".zip":
+        if not zipfile.is_zipfile(path):
+            return CacheValidation(
+                matched=False,
+                strength="miss",
+                reason="zip_header_invalid",
+                local_size=local_size,
+                remote_size=remote_size,
+                remote_md5=remote_md5,
+                remote_md5_usable=False,
+                zip_check="failed",
+            )
+        zip_check = "passed"
+
+    return CacheValidation(
+        matched=True,
+        strength="weak",
+        reason="remote_md5_unusable" if remote_md5 else "remote_md5_missing",
+        local_size=local_size,
+        remote_size=remote_size,
+        remote_md5=remote_md5,
+        remote_md5_usable=False,
+        zip_check=zip_check,
+    )
+
+
+def _is_standard_md5(value: str | None) -> bool:
+    return value is not None and len(value) == 32 and all(char in "0123456789abcdefABCDEF" for char in value)
+
+
+def _log_cache_validation(remote_path: str, local_path: Path, validation: CacheValidation) -> None:
+    message = "baidu cache hit" if validation.matched else "baidu cache stale"
+    logger.info(
+        (
+            "%s remote_path=%s local_path=%s decision=%s reason=%s local_size=%s remote_size=%s "
+            "remote_md5=%s remote_md5_usable=%s local_md5=%s md5_check=%s zip_check=%s"
+        ),
+        message,
+        remote_path,
+        local_path,
+        validation.strength,
+        validation.reason,
+        validation.local_size,
+        validation.remote_size,
+        validation.remote_md5,
+        validation.remote_md5_usable,
+        validation.local_md5,
+        validation.md5_check,
+        validation.zip_check,
+    )
+
+
+def _discard_partial_download(path: Path) -> None:
+    partial = path.with_name(f"{path.name}.part")
+    if partial.exists():
+        logger.info("baidu stale cache dropping partial download local_path=%s partial_path=%s", path, partial)
+        partial.unlink()

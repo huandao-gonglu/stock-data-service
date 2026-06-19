@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from stock_data_service.config import Settings
+from stock_data_service.market.path_strategy import BAIDU_STOCKK_TIMEFRAMES
 from stock_data_service.market.symbol_normalizer import normalize_symbol
 from stock_data_service.market.timeframe import Timeframe
 
@@ -51,7 +52,9 @@ def validate_admin_sync_settings(payload: dict) -> AdminSyncSettings:
     source_id = str(payload.get("source_id") or "baidu-main").strip()
     if not source_id:
         raise ValueError("source_id is required")
-    timeframe = Timeframe.parse(str(payload.get("timeframe") or Timeframe.M1.value)).value
+    timeframe = Timeframe.parse(str(payload.get("timeframe") or Timeframe.M1.value))
+    if timeframe not in BAIDU_STOCKK_TIMEFRAMES:
+        raise ValueError(f"timeframe {timeframe.value} is not available for Baidu sync")
     start = _date_string(payload.get("start"), "start")
     end = _date_string(payload.get("end"), "end")
     if dt.date.fromisoformat(start) > dt.date.fromisoformat(end):
@@ -64,7 +67,7 @@ def validate_admin_sync_settings(payload: dict) -> AdminSyncSettings:
         raise ValueError("at least one symbol is required")
     return AdminSyncSettings(
         source_id=source_id,
-        timeframe=timeframe,
+        timeframe=timeframe.value,
         start=start,
         end=end,
         symbols=normalized,

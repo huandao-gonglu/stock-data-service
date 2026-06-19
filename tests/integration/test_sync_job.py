@@ -61,6 +61,29 @@ def test_local_sync_job_can_ingest_another_symbol_and_changed_content(tmp_path):
     assert df.iloc[0]["close"] == 8
 
 
+def test_local_sync_job_ingests_multiple_symbols_from_one_archive(tmp_path):
+    raw = tmp_path / "raw/A鑲鍒嗘椂鏁版嵁/1鍒嗛挓"
+    raw.mkdir(parents=True)
+    (raw / "20241220_1min.zip").write_bytes(_zip_with_symbols(close=1))
+    metadata = SyncMetadata(tmp_path / "meta.duckdb")
+    result = LocalSyncJobRunner(raw_root=tmp_path / "raw", parquet_root=tmp_path / "parquet", metadata=metadata).run(
+        timeframe=Timeframe.M1,
+        start=dt.date(2024, 12, 20),
+        end=dt.date(2024, 12, 20),
+        symbols=["sh600000", "sz000001", "sh600004"],
+    )
+
+    assert result.scanned_count == 1
+    assert result.ingested_count == 2
+    assert result.failed_count == 0
+    rows = metadata.fetchall("SELECT symbol, status FROM file_ingests ORDER BY symbol")
+    assert rows == [
+        ("sh600000", "committed"),
+        ("sh600004", "symbol_missing"),
+        ("sz000001", "committed"),
+    ]
+
+
 def test_sync_job_continues_on_corrupted_zip(tmp_path):
     raw = tmp_path / "raw/A股_分时数据/1分钟"
     raw.mkdir(parents=True)
