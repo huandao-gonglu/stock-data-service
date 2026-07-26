@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from stock_data_service.config import Settings
 from stock_data_service.main import create_app
+from stock_data_service.market.security_master import SecurityListing
 from stock_data_service.storage.sync_metadata import SyncMetadata
 
 
@@ -251,6 +252,53 @@ def test_admin_symbols_api_lists_saved_listed_symbols(tmp_path):
     assert payload["count"] == 1
     assert payload["symbols"][0]["symbol"] == "sh600000"
     assert payload["symbols"][0]["listed_at"] == "1999-11-10"
+
+
+def test_admin_symbols_refresh_fetches_and_persists_when_empty(tmp_path, monkeypatch):
+    settings = Settings(data_root=tmp_path / "data")
+    app = create_app(settings)
+
+    class FakeSecurityMasterClient:
+        def fetch_all(self):
+            return [
+                SecurityListing(
+                    symbol="sh600000",
+                    code="600000",
+                    name="浦发银行",
+                    exchange="sh",
+                    listed_at=dt.date(1999, 11, 10),
+                    delisted_at=None,
+                    status="listed",
+                    source="baostock",
+                ),
+                SecurityListing(
+                    symbol="sz000003",
+                    code="000003",
+                    name="退市股票",
+                    exchange="sz",
+                    listed_at=dt.date(1991, 1, 1),
+                    delisted_at=dt.date(2002, 6, 14),
+                    status="delisted",
+                    source="baostock",
+                ),
+            ]
+
+    monkeypatch.setattr("stock_data_service.api.admin.BaostockSecurityMasterClient", FakeSecurityMasterClient)
+    client = TestClient(app)
+
+    assert client.get("/admin/api/symbols").json()["count"] == 0
+
+    response = client.post("/admin/api/symbols/refresh")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["refreshed_count"] == 2
+    assert payload["count"] == 1
+    assert payload["symbols"][0]["symbol"] == "sh600000"
+
+    metadata = SyncMetadata(settings.metadata_db)
+    metadata.initialize()
+    assert metadata.fetchone("SELECT COUNT(*) FROM symbols")[0] == 2
 
 
 def test_admin_baidu_oauth_start_and_callback_saves_token(tmp_path):

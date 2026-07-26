@@ -8,7 +8,7 @@ import duckdb
 import pandas as pd
 
 from stock_data_service.market.calendar import SSETradingCalendar
-from stock_data_service.market.timeframe import Timeframe
+from stock_data_service.market.timeframe import Timeframe, expected_intraday_rows
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -27,6 +27,34 @@ class DuckDBRepository:
         end: dt.datetime,
         limit: int = 5000,
         offset: int = 0,
+    ) -> pd.DataFrame:
+        df = self._query_partitioned_bars(
+            symbol=symbol,
+            timeframe=timeframe,
+            start=start,
+            end=end,
+            limit=limit,
+            offset=offset,
+        )
+        if not df.empty or timeframe != Timeframe.D1:
+            return df
+        return self._query_daily_from_intraday(
+            symbol=symbol,
+            start=start,
+            end=end,
+            limit=limit,
+            offset=offset,
+        )
+
+    def _query_partitioned_bars(
+        self,
+        *,
+        symbol: str,
+        timeframe: Timeframe,
+        start: dt.datetime,
+        end: dt.datetime,
+        limit: int,
+        offset: int,
     ) -> pd.DataFrame:
         files = self._candidate_files(symbol=symbol, timeframe=timeframe, start=start, end=end)
         if not files:
@@ -53,6 +81,57 @@ class DuckDBRepository:
                 """
                 params = [symbol, start, end, limit, offset]
             return con.execute(sql, params).df()
+
+    def _query_daily_from_intraday(
+        self,
+        *,
+        symbol: str,
+        start: dt.datetime,
+        end: dt.datetime,
+        limit: int,
+        offset: int,
+    ) -> pd.DataFrame:
+        files = self._candidate_files(symbol=symbol, timeframe=Timeframe.M1, start=start, end=end)
+        if not files:
+            return pd.DataFrame()
+
+        expected_rows = expected_intraday_rows(Timeframe.M1)
+        with duckdb.connect() as con:
+            con.from_parquet([str(path) for path in files]).create_view("bars")
+            return con.execute(
+                """
+                WITH filtered AS (
+                    SELECT *, CAST(ts AS DATE) AS trade_date
+                    FROM bars
+                    WHERE symbol = ? AND ts >= ? AND ts < ?
+                ),
+                daily AS (
+                    SELECT
+                        symbol,
+                        trade_date,
+                        arg_min(open, ts) AS open,
+                        max(high) AS high,
+                        min(low) AS low,
+                        arg_max(close, ts) AS close,
+                        sum(volume) AS volume,
+                        sum(amount) AS amount,
+                        min(source) AS source,
+                        min(source_path) AS source_path,
+                        max(ingested_at) AS ingested_at,
+                        count(*) AS bar_count,
+                        ? AS expected_bar_count,
+                        count(*) >= ? AS is_complete,
+                        CASE WHEN count(*) >= ? THEN 'ok' ELSE 'partial' END AS quality_flag
+                    FROM filtered
+                    GROUP BY symbol, trade_date
+                )
+                SELECT *
+                FROM daily
+                ORDER BY trade_date ASC
+                LIMIT ? OFFSET ?
+                """,
+                [symbol, start, end, expected_rows, expected_rows, expected_rows, limit, offset],
+            ).df()
 
     def coverage_summary(self, *, symbol: str, timeframe: Timeframe) -> dict:
         with duckdb.connect(str(self.metadata_db)) as con:

@@ -122,3 +122,69 @@ def test_queries_daily_bars_by_trade_date_and_resists_symbol_injection(tmp_path,
         end=dt.datetime(2024, 12, 24),
     )
     assert injected.empty
+
+
+def test_queries_daily_bars_by_aggregating_minute_bars_when_daily_partition_missing(tmp_path, metadata):
+    writer = ParquetBarWriter(tmp_path / "parquet")
+    writer.write_bars(
+        pd.DataFrame(
+            [
+                {
+                    "symbol": "sh600000",
+                    "code": "sh600000",
+                    "name": "浦发银行",
+                    "ts": dt.datetime(2024, 12, 20, 9, 30),
+                    "open": 10,
+                    "high": 11,
+                    "low": 9,
+                    "close": 10.5,
+                    "volume": 100,
+                    "amount": 1000,
+                },
+                {
+                    "symbol": "sh600000",
+                    "code": "sh600000",
+                    "name": "浦发银行",
+                    "ts": dt.datetime(2024, 12, 20, 9, 31),
+                    "open": 10.5,
+                    "high": 12,
+                    "low": 10,
+                    "close": 11.5,
+                    "volume": 200,
+                    "amount": 2500,
+                },
+                {
+                    "symbol": "sh600000",
+                    "code": "sh600000",
+                    "name": "浦发银行",
+                    "ts": dt.datetime(2024, 12, 23, 9, 30),
+                    "open": 12,
+                    "high": 13,
+                    "low": 11,
+                    "close": 12.5,
+                    "volume": 300,
+                    "amount": 3600,
+                },
+            ]
+        ),
+        Timeframe.M1,
+    )
+    repo = DuckDBRepository(tmp_path / "parquet", metadata.db_path)
+
+    df = repo.query_bars(
+        symbol="sh600000",
+        timeframe=Timeframe.D1,
+        start=dt.datetime(2024, 12, 20),
+        end=dt.datetime(2024, 12, 24),
+    )
+
+    assert [value.date() if hasattr(value, "date") else value for value in df["trade_date"]] == [
+        dt.date(2024, 12, 20),
+        dt.date(2024, 12, 23),
+    ]
+    assert list(df["open"]) == [10, 12]
+    assert list(df["high"]) == [12, 13]
+    assert list(df["low"]) == [9, 11]
+    assert list(df["close"]) == [11.5, 12.5]
+    assert list(df["volume"]) == [300, 300]
+    assert list(df["amount"]) == [3500, 3600]

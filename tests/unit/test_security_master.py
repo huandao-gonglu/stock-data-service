@@ -1,6 +1,8 @@
 import datetime as dt
 
-from stock_data_service.market.security_master import _listings_from_baostock_rows
+import pytest
+
+from stock_data_service.market.security_master import SecurityListing, _listings_from_baostock_rows, _validate_listing_set
 
 
 def test_builds_stock_listings_from_baostock_rows():
@@ -40,3 +42,22 @@ def test_builds_stock_listings_from_baostock_rows():
     assert listings[1].symbol == "sz000003"
     assert listings[1].delisted_at == dt.date(2002, 6, 14)
     assert listings[1].status == "delisted"
+
+
+def test_rejects_incomplete_stock_listing_set():
+    listings = [
+        SecurityListing(
+            symbol=f"sh600{i:03d}",
+            code=f"600{i:03d}",
+            name=f"股票{i}",
+            exchange="sh",
+            listed_at=dt.date(2000, 1, 1),
+            delisted_at=None,
+            status="listed",
+            source="baostock",
+        )
+        for i in range(863)
+    ]
+
+    with pytest.raises(RuntimeError, match="incomplete symbol list"):
+        _validate_listing_set(listings)

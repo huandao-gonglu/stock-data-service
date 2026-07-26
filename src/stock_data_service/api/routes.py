@@ -189,6 +189,10 @@ def _row_to_response(row: pd.Series, timeframe: Timeframe) -> dict:
     }
     if timeframe == Timeframe.D1:
         value = row.get("trade_date")
+        if isinstance(value, pd.Timestamp):
+            value = value.date()
+        elif isinstance(value, dt.datetime):
+            value = value.date()
         if hasattr(value, "isoformat"):
             base["trade_date"] = value.isoformat()
         else:

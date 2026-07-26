@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
+import time
 from dataclasses import dataclass
 from typing import Iterable
+
+logger = logging.getLogger(__name__)
+MIN_TOTAL_SYMBOL_COUNT = 4000
+MIN_LISTED_SYMBOL_COUNT = 3000
+DEFAULT_FETCH_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -21,6 +28,31 @@ class BaostockSecurityMasterClient:
     source = "baostock"
 
     def fetch_all(self) -> list[SecurityListing]:
+        errors: list[str] = []
+        for attempt in range(1, DEFAULT_FETCH_ATTEMPTS + 1):
+            try:
+                listings = self._fetch_all_once()
+                _validate_listing_set(listings)
+                return listings
+            except Exception as exc:
+                errors.append(str(exc))
+                if attempt >= DEFAULT_FETCH_ATTEMPTS:
+                    break
+                logger.warning(
+                    "baostock security master fetch failed attempt=%s/%s error=%s",
+                    attempt,
+                    DEFAULT_FETCH_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(0.5 * attempt)
+
+        last_error = errors[-1] if errors else "unknown error"
+        raise RuntimeError(
+            "baostock query_stock_basic failed to return a complete symbol list "
+            f"after {DEFAULT_FETCH_ATTEMPTS} attempts: {last_error}"
+        )
+
+    def _fetch_all_once(self) -> list[SecurityListing]:
         try:
             import baostock as bs
         except ImportError as exc:
@@ -40,6 +72,20 @@ class BaostockSecurityMasterClient:
             bs.logout()
 
         return list(_listings_from_baostock_rows(rows))
+
+
+def _validate_listing_set(listings: list[SecurityListing]) -> None:
+    listed = [listing for listing in listings if listing.status == "listed"]
+    listed_exchanges = {listing.exchange for listing in listed}
+    if (
+        len(listings) < MIN_TOTAL_SYMBOL_COUNT
+        or len(listed) < MIN_LISTED_SYMBOL_COUNT
+        or not {"sh", "sz"}.issubset(listed_exchanges)
+    ):
+        raise RuntimeError(
+            "baostock query_stock_basic returned incomplete symbol list: "
+            f"total={len(listings)} listed={len(listed)} exchanges={sorted(listed_exchanges)}"
+        )
 
 
 def _listings_from_baostock_rows(rows: Iterable[dict[str, str]]) -> Iterable[SecurityListing]:

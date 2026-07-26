@@ -16,8 +16,26 @@ def _client_with_data(tmp_path):
     ParquetBarWriter(settings.parquet_root).write_bars(
         pd.DataFrame(
             [
-                {"symbol": "sh600000", "ts": dt.datetime(2024, 12, 20, 9, 30), "open": 1, "high": 1, "low": 1, "close": 1},
-                {"symbol": "sh600000", "ts": dt.datetime(2024, 12, 20, 9, 31), "open": 2, "high": 2, "low": 2, "close": 2},
+                {
+                    "symbol": "sh600000",
+                    "ts": dt.datetime(2024, 12, 20, 9, 30),
+                    "open": 1,
+                    "high": 1,
+                    "low": 1,
+                    "close": 1,
+                    "volume": 10,
+                    "amount": 100,
+                },
+                {
+                    "symbol": "sh600000",
+                    "ts": dt.datetime(2024, 12, 20, 9, 31),
+                    "open": 2,
+                    "high": 3,
+                    "low": 2,
+                    "close": 2,
+                    "volume": 20,
+                    "amount": 200,
+                },
             ]
         ),
         Timeframe.M1,
@@ -55,6 +73,38 @@ def test_health_and_bars_endpoint(tmp_path):
     data = response.json()
     assert data["rows"][0]["ts"] == "2024-12-20T09:30:00+08:00"
     assert len(data["rows"]) == 2
+
+
+def test_daily_bars_endpoint_aggregates_minute_data_when_daily_partition_missing(tmp_path):
+    client = _client_with_data(tmp_path)
+    response = client.get(
+        "/bars",
+        params={
+            "symbol": "sh600000",
+            "timeframe": "1d",
+            "start": "2024-12-20T00:00:00+08:00",
+            "end": "2024-12-21T00:00:00+08:00",
+        },
+    )
+
+    assert response.status_code == 200
+    rows = response.json()["rows"]
+    assert rows == [
+        {
+            "ts": None,
+            "trade_date": "2024-12-20",
+            "open": 1,
+            "high": 3,
+            "low": 1,
+            "close": 2,
+            "volume": 30,
+            "amount": 300,
+            "code": None,
+            "name": None,
+            "change_pct": None,
+            "amplitude": None,
+        }
+    ]
 
 
 def test_bars_validation_range_and_pagination(tmp_path):

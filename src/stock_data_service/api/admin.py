@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import threading
 from dataclasses import asdict
 from typing import Any
 from typing import Callable
@@ -15,6 +16,7 @@ from stock_data_service.auth.baidu_authorizer import BaiduAuthorizationError, Ba
 from stock_data_service.auth.token_manager import TokenManager
 from stock_data_service.config import Settings
 from stock_data_service.market.calendar import SSETradingCalendar, natural_days
+from stock_data_service.market.security_master import BaostockSecurityMasterClient
 from stock_data_service.market.symbol_normalizer import SymbolValidationError, normalize_symbol
 from stock_data_service.market.timeframe import Timeframe
 from stock_data_service.storage.sync_metadata import SyncMetadata
@@ -23,6 +25,7 @@ from stock_data_service.sync.manager import ManagedFileSyncRequest, ManagedSyncR
 logger = logging.getLogger(__name__)
 BAIDU_DATA_ROOT = "/A股_分时数据"
 MAX_CALENDAR_RANGE_DAYS = 366 * 80
+_SYMBOL_REFRESH_LOCK = threading.Lock()
 
 
 def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> APIRouter:
@@ -132,23 +135,34 @@ def create_admin_router(settings: Settings, admin_auth_dependency: Callable) -> 
         limit: int = Query(10000, ge=1, le=100000),
     ) -> dict:
         rows = _symbol_rows(settings, status=status, limit=limit)
-        return {
-            "status": status,
-            "count": len(rows),
-            "symbols": [
-                {
-                    "symbol": row[0],
-                    "code": row[1],
-                    "name": row[2],
-                    "exchange": row[3],
-                    "listed_at": _iso(row[4]),
-                    "delisted_at": _iso(row[5]),
-                    "status": row[6],
-                    "source": row[7],
-                }
-                for row in rows
-            ],
-        }
+        return _symbols_payload(status, rows)
+
+    @router.post("/admin/api/symbols/refresh")
+    def refresh_symbols(
+        payload: dict | None = Body(default=None),
+        status: str = Query("listed"),
+        limit: int = Query(100000, ge=1, le=100000),
+    ) -> dict:
+        provider = str((payload or {}).get("provider") or "baostock")
+        if provider != "baostock":
+            raise HTTPException(status_code=400, detail=f"unsupported provider: {provider}")
+
+        metadata = SyncMetadata(settings.metadata_db)
+        metadata.initialize()
+        with _SYMBOL_REFRESH_LOCK:
+            try:
+                listings = BaostockSecurityMasterClient().fetch_all()
+            except Exception as exc:
+                logger.exception("admin symbols refresh failed provider=%s", provider)
+                raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+            refreshed_count = metadata.upsert_symbols(listings)
+        rows = _symbol_rows(settings, status=status, limit=limit)
+        result = _symbols_payload(status, rows)
+        result["provider"] = provider
+        result["refreshed_count"] = refreshed_count
+        logger.info("admin symbols refreshed provider=%s count=%s", provider, refreshed_count)
+        return result
 
     @router.get("/admin/api/coverage/calendar")
     def coverage_calendar(
@@ -676,6 +690,26 @@ def _symbol_rows(settings: Settings, *, status: str, limit: int) -> list:
     )
 
 
+def _symbols_payload(status: str, rows: list) -> dict:
+    return {
+        "status": status,
+        "count": len(rows),
+        "symbols": [
+            {
+                "symbol": row[0],
+                "code": row[1],
+                "name": row[2],
+                "exchange": row[3],
+                "listed_at": _iso(row[4]),
+                "delisted_at": _iso(row[5]),
+                "status": row[6],
+                "source": row[7],
+            }
+            for row in rows
+        ],
+    }
+
+
 def _iso(value) -> str | None:
     return value.isoformat() if hasattr(value, "isoformat") else value
 
@@ -1082,6 +1116,7 @@ _ADMIN_HTML = """<!doctype html>
   <script>
     const $ = (id) => document.getElementById(id);
     const apiKeyInput = $("adminKey");
+    const MIN_MARKET_SYMBOL_COUNT = 3000;
     let activeJobId = null;
     let netdiskPage = 1;
     let netdiskHasMore = false;
@@ -1527,15 +1562,29 @@ _ADMIN_HTML = """<!doctype html>
       }
     });
     $("fullSyncBtn").addEventListener("click", async () => {
+      const button = $("fullSyncBtn");
+      button.disabled = true;
       try {
         $("settingsMessage").textContent = "Loading listed symbols...";
-        const data = await api("/admin/api/symbols?status=listed&limit=100000", {method: "GET"});
-        const symbols = (data.symbols || []).map((item) => item.symbol).filter(Boolean);
-        if (!symbols.length) throw new Error("No listed symbols. Run refresh-symbols first.");
+        let data = await api("/admin/api/symbols?status=listed&limit=100000", {method: "GET"});
+        let symbols = (data.symbols || []).map((item) => item.symbol).filter(Boolean);
+        if (symbols.length < MIN_MARKET_SYMBOL_COUNT) {
+          const reason = symbols.length ? `Only ${symbols.length} local listed symbols found.` : "Local symbol list is empty.";
+          $("settingsMessage").textContent = `${reason} Refreshing from market API...`;
+          data = await api("/admin/api/symbols/refresh?status=listed&limit=100000", {method: "POST", body: "{}"});
+          symbols = (data.symbols || []).map((item) => item.symbol).filter(Boolean);
+        }
+        if (symbols.length < MIN_MARKET_SYMBOL_COUNT) {
+          throw new Error(`Market symbol list is incomplete (${symbols.length} listed symbols). Please retry after the market API recovers.`);
+        }
         $("symbols").value = symbols.join(String.fromCharCode(10));
-        $("settingsMessage").textContent = `Filled ${symbols.length} listed symbols. Click sync selected symbols to start.`;
+        const refreshed = Number(data.refreshed_count || 0);
+        const refreshText = refreshed > 0 ? ` Refreshed ${refreshed} symbols from market API.` : "";
+        $("settingsMessage").textContent = `Filled ${symbols.length} listed symbols.${refreshText} Click sync selected symbols to start.`;
       } catch (err) {
         $("settingsMessage").textContent = err.message;
+      } finally {
+        button.disabled = false;
       }
     });
     $("stopBtn").addEventListener("click", async () => {
